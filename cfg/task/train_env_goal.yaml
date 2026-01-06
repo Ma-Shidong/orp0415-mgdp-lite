@@ -1,0 +1,120 @@
+name: Env
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 128
+  max_episode_length: 3000
+
+drone_model:
+  name: Hummingbird
+  controller: LeeAccelerationController
+
+time_encoding: true
+static_obs_num_per_gird: 1 #2
+dynamic_obs_num: 20 #40
+trace_prob: 0.5 
+
+lidar_range: 10.
+lidar_h_res: 36
+lidar_v_res: 6
+lidar_h_sample: 3
+lidar_v_sample: 3
+lidar_hfov: 360
+lidar_vfov: [-7., 52.]
+lidar_use_height_filter: false
+lidar_radial_window: 3
+lidar_radial_min_depth: 0.1
+lidar_radial_max_depth: 10.0
+lidar_radial_min_speed: 0.01
+lidar_radial_max_speed: 10.0
+lidar_radial_invalid_value: 0.0
+lidar_radial_dt: 0.02
+lidar_risk_decay_tau: 1.0
+lidar_risk_clear_time: 3.0
+lidar_risk_clear_margin: 1.0
+lidar_risk_enable: true
+bound_h: 1.
+
+
+flow_gap: 25   
+flow_slide_window: 5   
+
+vis_lidar: false
+vis_dismap: false
+
+action_transform: null
+
+reward_effort_weight: 0.1
+reward_cfg:
+  k_s: 0.0
+lidar_effective_range: 8.0 #/m
+lidar_v_edge_margin_deg: 6.0 #/degree
+
+# -----------------------------
+# Goal-oriented reward settings
+# -----------------------------
+reward_weights:
+  k_v: 0.8
+  k_a: 0.3
+  k_j: 0.1
+  k_h: 0.2
+  k_g: 1.5
+  k_s: 0.0
+  k_d: 0.0
+reach_goal_dis: 1.0
+# "Touch" radius used in reward shaping (slow down / stop shaping).
+# Default equals reach_goal_dis to avoid a reward gap. Increase if you explicitly
+# want a larger slow-down zone near the goal.
+touch_goal_dis: 1.0
+terminate_on_success: true
+success_bonus: 20.0
+time_penalty: 0.02
+
+# Make safety reward penalty-only (no extra reward when far from obstacles)
+safety_reward_max: 0.0
+
+# Risk-memory options (optimized for vertical FOV edge disappearance)
+lidar_risk_keep_far: false   # keep memory ONLY for top/bottom vertical edge bands (recommended)
+
+
+# -----------------------------
+# Risk-aware reward (TTC-based)
+# -----------------------------
+goal_reward_type: linear
+goal_w_d: 10.0
+goal_w_theta: 1.0
+
+risk_gate_goal: true
+risk_gate_g_min: 0.3
+
+risk_relax_enable: true
+risk_relax_eta_j: 0.5
+risk_relax_eta_h: 0.5
+
+risk_reward_enable: true
+# risk_cfg:
+#   T0: 3.0
+#   v_min: 0.1
+#   beta: 12.0
+#   max_range: 8.0
+#   alpha: 10.0
+#   rho0: 0.2
+#   w_r: 1.5
+
+risk_cfg:
+  T0: 1.0
+  v_min: 0.05
+  beta: 10.0
+  max_range: 8.0
+  alpha: 10.0
+  rho0: 0.2
+  w_r: 1.0
+
+collision_penalty: 10.0
+collision_include_height: true
+
+# Debug prints are expensive; keep them off in training
+debug_print_reward: false

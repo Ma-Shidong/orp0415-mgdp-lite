@@ -1,0 +1,58 @@
+name: Env
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 128
+  max_episode_length: 3000
+
+drone_model:
+  name: Hummingbird
+  controller: LeeAccelerationController
+
+time_encoding: true
+static_obs_num_per_gird: 2 
+dynamic_obs_num: 40
+trace_prob: 0.5 
+
+lidar_range: 10.
+lidar_h_res: 36
+lidar_v_res: 6
+lidar_h_sample: 3
+lidar_v_sample: 3
+lidar_hfov: 360
+lidar_vfov: [-7., 52.]
+lidar_use_height_filter: false
+lidar_radial_window: 3
+lidar_radial_min_depth: 0.1
+lidar_radial_max_depth: 10.0
+lidar_radial_min_speed: 0.01
+lidar_radial_max_speed: 10.0
+lidar_radial_invalid_value: 0.0
+lidar_radial_dt: 0.02
+lidar_risk_decay_tau: 1.0
+lidar_risk_clear_time: 3.0
+lidar_risk_clear_margin: 1.0
+lidar_risk_enable: true
+bound_h: 1.
+
+
+flow_gap: 25   
+flow_slide_window: 5   
+
+vis_lidar: false
+vis_dismap: false
+
+action_transform: null
+
+reward_effort_weight: 0.1
+reward_cfg:
+  k_s: 5.0
+
+lidar_effective_range: 8.0 #/m
+lidar_v_edge_margin_deg: 6.0 #/degree
+
+# Risk-memory options (optimized for vertical FOV edge disappearance)
+lidar_risk_keep_far: false   # keep memory ONLY for top/bottom vertical edge bands (recommended)

@@ -1,0 +1,71 @@
+lidar_range: 10.
+lidar_h_res: 36
+lidar_v_res: 6
+lidar_h_sample: 3
+lidar_v_sample: 3
+lidar_hfov: 360
+lidar_vfov: [-7., 52.]
+lidar_use_height_filter: false
+lidar_radial_window: 3
+lidar_radial_min_depth: 0.1
+lidar_radial_max_depth: 10.0
+lidar_radial_min_speed: 0.01
+lidar_radial_max_speed: 10.0
+lidar_radial_invalid_value: 0.0
+lidar_radial_dt: 0.02
+lidar_risk_decay_tau: 1.0
+lidar_risk_clear_time: 3.0
+lidar_risk_clear_margin: 1.0
+lidar_risk_enable: true
+bound_h: 1.
+flow_gap: 25
+flow_slide_window: 5
+
+lidar_effective_range: 8.0 #/m
+lidar_v_edge_margin_deg: 6.0 #/degree
+
+# --- match training env constraints ---
+virtual_ground: 0.5
+virtual_ceiling: 3.5
+# vel_limit: 6.0
+
+
+# -----------------------------
+# Inference-only (ROS sim) opts
+# -----------------------------
+ckpt_path: "../models/orp4.7.pt"  # override if you want to test a different checkpoint
+auto_test: true           # if no RViz goal is provided, use default_goal_xyz
+auto_test_toggle: false   # true = keep toggling between auto_goal_a/auto_goal_b
+start_xyz: [0.0, -15.0, 2.0]
+default_goal_xyz: [0.0, 15.0, 2.0]
+auto_goal_a: [0.0, 15.0, 2.0]
+auto_goal_b: [0.0, -15.0, 2.0]
+wait_goal_time: 3.0
+stop_when_reach_goal: false
+reach_goal_dis: 1.0
+
+# Yaw is not predicted by the policy. Choose a yaw strategy for offboard control.
+#   - fixed: match training default (pi/4)
+#   - goal: face goal direction
+#   - hold: hold current yaw
+yaw_mode: fixed
+fixed_yaw: 0.78539816339
+
+# virtual constraints (keep behaviour closer to training)
+sim_dt: 0.02
+vel_damping: 0.05
+vel_limit: 6.0
+enable_xy_bound: true
+bound_margin: 0.3
+bound_restitution: 0.0
+# if /dynamic_env/map/x_size and y_size exist, bounds are auto-derived; otherwise set x_bound/y_bound here.
+# x_bound: 6.5
+# y_bound: 17.5
+
+# collision behaviour
+collision_stop: true
+safety_dis: 0.3
+goal_acc_bias: 0.0  # m/s^2, set e.g. 0.5~2.0 if the policy refuses to go to goal
+
+# Risk-memory options (optimized for vertical FOV edge disappearance)
+lidar_risk_keep_far: false   # keep memory ONLY for top/bottom vertical edge bands (recommended)
