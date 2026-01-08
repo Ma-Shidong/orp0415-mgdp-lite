@@ -273,13 +273,6 @@ def main(cfg):
     run = init_wandb(cfg)
     setproctitle(run.name)
 
-    # Make W&B x-axis be *iter* (1 iter = 1 PPO update on one rollout chunk).
-    try:
-        wandb.define_metric("iter")
-        wandb.define_metric("*", step_metric="iter")
-    except Exception:
-        pass
-
     print(OmegaConf.to_yaml(cfg))
 
     from resources.envs.isaac_env import IsaacEnv  # noqa: WPS433
@@ -337,7 +330,7 @@ def main(cfg):
     max_iters = int(cfg.get("max_iters", -1))
     eval_interval = int(cfg.get("eval_interval", -1))
     save_interval = int(cfg.get("save_interval", -1))
-    log_interval = int(cfg.get("log_interval", 1))  # log every iter by default
+    log_interval = int(cfg.get("log_interval", 100))  # default: log every 100 iters to reduce overhead
     print_interval = int(cfg.get("print_interval", 50))
 
     torch.backends.cudnn.benchmark = True
@@ -351,6 +344,33 @@ def main(cfg):
         if isinstance(k, tuple) and k[0] == "stats"
     ]
     episode_stats = EpisodeStats(stats_keys)
+
+    def _alias_reward_metrics(info: dict, prefix: str) -> None:
+        """Add a small set of reward-related keys for W&B dashboards.
+
+        We keep this intentionally minimal to avoid cluttering the run with too many metrics.
+        Expected source keys format:
+          - {prefix}/stats.<stat_key>    (e.g., train/stats.return, eval/stats.reward_goal)
+        """
+        def _copy(stat_key: str, name: str) -> None:
+            src = f"{prefix}/stats.{stat_key}"
+            if src in info and isinstance(info[src], (float, int)):
+                info[f"{prefix}/reward/{name}"] = info[src]
+
+        # Total episode reward
+        _copy("return", "return")
+
+        # Key reward components (most informative)
+        _copy("reward_goal", "goal")
+        _copy("reward_velocity", "velocity")
+        _copy("reward_safety", "safety")
+
+        # Task progress
+        _copy("goal_gate", "goalgate")
+
+        # Motion state summary
+        _copy("avg_speed", "avg_speed")
+        _copy("avg_acc", "avg_acc")
 
     collector = SyncDataCollector(
         env,
@@ -410,6 +430,7 @@ def main(cfg):
 
         info = {"iter": iter_idx}
         info.update({f"eval/stats.{k}": torch.mean(v.float()).item() for k, v in traj_stats.items()})
+        _alias_reward_metrics(info, "eval")
 
         if render_video and render_callback:
             vid = render_callback.get_video_array(axes="t c h w")
@@ -456,6 +477,7 @@ def main(cfg):
                 for k, v in episode_stats.pop().items(True, True)
             }
             info.update(stats)
+            _alias_reward_metrics(info, "train")
 
         info.update(policy.train_op(td))
 
@@ -470,7 +492,17 @@ def main(cfg):
             info.update(evaluate(iter_idx=i, render_video=True))
 
         if log_interval > 0 and (i % log_interval == 0):
-            run.log(info, step=i)
+            # reduce W&B payload: drop redundant / noisy keys
+            drop_exact = {"iter", "env_frames", "frames_per_batch"}
+            drop_substr = ("truncated", "timeout", "nan")
+            log_info = {}
+            for k, v in info.items():
+                if k in drop_exact:
+                    continue
+                if any(s in str(k) for s in drop_substr):
+                    continue
+                log_info[k] = v
+            run.log(log_info, step=i)
 
         if print_interval > 0 and (i % print_interval == 0):
             printable = {k: v for k, v in info.items() if isinstance(v, (float, int))}

@@ -48,10 +48,27 @@ class Env(IsaacEnv):
         self.vel_min = 3.5
         self.vel_max = 5.
         self.acc_max = 10.
-        self.acc_min = -self.acc_max
         self.virtual_ground = 0.5
         self.virtual_ceiling = 3.5
         self.height_bound = 0.5
+
+        # allow overriding constraints from cfg.task (useful for curriculum / inference)
+        try:
+            task_cfg = getattr(self.cfg, "task", None)
+            if task_cfg is not None and hasattr(task_cfg, "get"):
+                self.safety_dis = float(task_cfg.get("safety_dis", self.safety_dis))
+                self.vel_min = float(task_cfg.get("vel_min", self.vel_min))
+                self.vel_max = float(task_cfg.get("vel_max", self.vel_max))
+                self.acc_max = float(task_cfg.get("acc_max", self.acc_max))
+                self.virtual_ground = float(task_cfg.get("virtual_ground", self.virtual_ground))
+                self.virtual_ceiling = float(task_cfg.get("virtual_ceiling", self.virtual_ceiling))
+                self.height_bound = float(task_cfg.get("height_bound", self.height_bound))
+        except Exception:
+            # keep defaults
+            pass
+
+        # derived
+
 
         self.start_pos = None
         self.target_pos = None
@@ -152,6 +169,21 @@ class Env(IsaacEnv):
         
         self.seed = 10
         self.static_obs_num_per_gird = self.cfg.task.static_obs_num_per_gird
+        # obstacle height configuration (from cfg.task)
+        try:
+            _hr = self.cfg.task.get("static_obs_height_range", [3.5, 4.0])
+        except Exception:
+            _hr = [3.5, 4.0]
+        try:
+            static_obs_height_range = (float(_hr[0]), float(_hr[1]))
+        except Exception:
+            static_obs_height_range = (3.5, 4.0)
+
+        try:
+            self.dobs_height = float(self.cfg.task.get("dobs_height", 4.0))
+        except Exception:
+            self.dobs_height = 4.0
+
         terrain_cfg = TerrainImporterCfg(
             num_envs=self.num_envs,
             prim_path="/World/ground",
@@ -175,7 +207,7 @@ class Env(IsaacEnv):
                         num_obstacles=self.static_obs_num_per_gird,
                         obstacle_height_mode="fixed",
                         obstacle_width_range=(0.5, 0.9),
-                        obstacle_height_range=(3.5, 4.0),
+                        obstacle_height_range=static_obs_height_range,
                         platform_width=1.5,
                     )
                 },
@@ -186,40 +218,49 @@ class Env(IsaacEnv):
         )
         terrain: TerrainImporter = terrain_cfg.class_type(terrain_cfg)
 
-        self.dynamic_obs_num = self.cfg.task.dynamic_obs_num
+        # dynamic obstacles (support disabling with dynamic_obs_num=0)
+        self.dynamic_obs_num = int(self.cfg.task.dynamic_obs_num)
         self.dobs_pos_x_range = (-18.0, 18.0)
         self.dobs_pos_y_range = (-18.0, 18.0)
         self.dobs_vel_range = (1.0, 5.0)
         self.dobs_rad_range = (0.25, 0.45)
-        self.dobs_height = 4.
-        self.dobs_states = env_utils.generate_obstacle_tensor(self.dynamic_obs_num, 
-                                                         self.dobs_pos_x_range,
-                                                         self.dobs_pos_y_range, 
-                                                         self.dobs_vel_range, 
-                                                         self.dobs_rad_range,
-                                                         self.seed)
-        self.dobs_origins = self.dobs_states[:, 0]
-        self.dobs_rad = self.dobs_states[:, 2][:, 0]
-        dobs_cfg_dict = {}
-        for i, origin in enumerate(self.dobs_origins):
-            cylinder_cfg = RigidObjectCfg(
-                prim_path=f"/World/moving_obs{i}/Cylinder",
-                spawn=sim_utils.CylinderCfg(
-                    radius=self.dobs_rad[i],
-                    height=self.dobs_height,
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        disable_gravity=True),
-                    collision_props=sim_utils.CollisionPropertiesCfg(
-                        collision_enabled=False),
-                ),
-                init_state=RigidObjectCfg.InitialStateCfg()
+        if self.dynamic_obs_num <= 0:
+            self.dynamic_obs_num = 0
+            self.dobs_states = torch.zeros((0, 3, 2), device=self.device)
+            self.dobs_origins = torch.zeros((0, 2), device=self.device)
+            self.dobs_rad = torch.zeros((0,), device=self.device)
+            self.dobs = None
+        else:
+            _dobs_states_np = env_utils.generate_obstacle_tensor(
+                self.dynamic_obs_num,
+                self.dobs_pos_x_range,
+                self.dobs_pos_y_range,
+                self.dobs_vel_range,
+                self.dobs_rad_range,
+                self.seed,
             )
-            dobs_cfg_dict[f"Cylinder_{i}"] = cylinder_cfg
-        cylinder_collection_cfg = RigidObjectCollectionCfg(rigid_objects = dobs_cfg_dict)
-        self.dobs = RigidObjectCollection(cfg = cylinder_collection_cfg)
-        self.dobs_states = torch.tensor(self.dobs_states, device=self.device)
-        self.dobs_origins = torch.tensor(self.dobs_origins, device=self.device)
-
+            self.dobs_states = torch.tensor(_dobs_states_np, device=self.device)
+            self.dobs_origins = self.dobs_states[:, 0]
+            self.dobs_rad = self.dobs_states[:, 2][:, 0]
+            dobs_cfg_dict = {}
+            for i, origin in enumerate(self.dobs_origins):
+                cylinder_cfg = RigidObjectCfg(
+                    prim_path=f"/World/moving_obs{i}/Cylinder",
+                    spawn=sim_utils.CylinderCfg(
+                        radius=float(self.dobs_rad[i].item()),
+                        height=self.dobs_height,
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                            disable_gravity=True
+                        ),
+                        collision_props=sim_utils.CollisionPropertiesCfg(
+                            collision_enabled=False
+                        ),
+                    ),
+                    init_state=RigidObjectCfg.InitialStateCfg(),
+                )
+                dobs_cfg_dict[f"Cylinder_{i}"] = cylinder_cfg
+            cylinder_collection_cfg = RigidObjectCollectionCfg(rigid_objects=dobs_cfg_dict)
+            self.dobs = RigidObjectCollection(cfg=cylinder_collection_cfg)
         self.wall_num = 1
         self.wall_width = 20
         self.wall_height = 0.4
@@ -337,7 +378,32 @@ class Env(IsaacEnv):
             "avg_acc": UnboundedContinuousTensorSpec(1),
             "max_acc": UnboundedContinuousTensorSpec(1),
             "return": UnboundedContinuousTensorSpec(1),
-            "episode_len": UnboundedContinuousTensorSpec(1)
+            "episode_len": UnboundedContinuousTensorSpec(1),
+            "terminated": UnboundedContinuousTensorSpec(1),
+            "truncated": UnboundedContinuousTensorSpec(1),
+            "done_any": UnboundedContinuousTensorSpec(1),
+            "done_success": UnboundedContinuousTensorSpec(1),
+            "done_timeout": UnboundedContinuousTensorSpec(1),
+            "done_safety": UnboundedContinuousTensorSpec(1),
+            "done_height_low": UnboundedContinuousTensorSpec(1),
+            "done_height_high": UnboundedContinuousTensorSpec(1),
+            "done_bound": UnboundedContinuousTensorSpec(1),
+            "done_vel_limit": UnboundedContinuousTensorSpec(1),
+            "done_acc_limit": UnboundedContinuousTensorSpec(1),
+            "done_nan": UnboundedContinuousTensorSpec(1),
+            "done_other": UnboundedContinuousTensorSpec(1),
+            "done_rate": UnboundedContinuousTensorSpec(1),
+            "done_ratio_success": UnboundedContinuousTensorSpec(1),
+            "done_ratio_timeout": UnboundedContinuousTensorSpec(1),
+            "done_ratio_safety": UnboundedContinuousTensorSpec(1),
+            "done_ratio_height_low": UnboundedContinuousTensorSpec(1),
+            "done_ratio_height_high": UnboundedContinuousTensorSpec(1),
+            "done_ratio_bound": UnboundedContinuousTensorSpec(1),
+            "done_ratio_vel_limit": UnboundedContinuousTensorSpec(1),
+            "done_ratio_acc_limit": UnboundedContinuousTensorSpec(1),
+            "done_ratio_nan": UnboundedContinuousTensorSpec(1),
+            "done_ratio_other": UnboundedContinuousTensorSpec(1)
+
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec 
         self.stats = stats_spec.zero()
@@ -424,46 +490,67 @@ class Env(IsaacEnv):
         self.last_acc = None
         self.last_act = None
         self.last_vel = None
+        self._global_frame_count = 0  # global env-frame counter for curricula (counts vectorized transitions)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
-        if self.set_dobs_state is None:
-            self.set_dobs_state = self.dobs.data.default_object_state.clone()
-            self.set_dobs_state[..., :2] = self.dobs_origins
-            self.set_dobs_state[..., 2] = self.dobs_height/2
-        else:
-            if self.trace_prob is None:
-                self.trace_prob = self.cfg.task.trace_prob
-            self.dobs_states[:, 1] = env_utils.update_dobs_vel(self.device, self.dobs_states, 
-                                                               self.dobs_pos_x_range, self.dobs_pos_y_range, 
-                                                               self.drone, self.trace_prob)
-            set_dobs_vel = self.dobs_states[:, 1]
-            self.set_dobs_state[..., :2] = self.dobs_states[:, 0] + (set_dobs_vel * self.dt)
-            self.set_dobs_state[..., 2] = self.dobs_height/2
-            self.dobs_states[:, 0] = self.set_dobs_state[..., :2]
-        self.dobs.write_object_link_pose_to_sim(self.set_dobs_state[..., :7])
+        # defensive: ensure acc_min exists (older configs / patches)
+        if not hasattr(self, 'acc_min'):
+            self.acc_min = -self.acc_max
+        # cache drone state once per step to avoid repeated sim queries
+        drone_state_pre = self.drone.get_state(env_frame=False)
+        drone_pos_xy = drone_state_pre[..., :2]
+        if drone_pos_xy.ndim == 3 and drone_pos_xy.shape[1] == 1:
+            drone_pos_xy = drone_pos_xy.squeeze(1)
+        if (getattr(self, "dynamic_obs_num", 0) > 0) and (self.dobs is not None):
+            if self.set_dobs_state is None:
+                self.set_dobs_state = self.dobs.data.default_object_state.clone()
+                self.set_dobs_state[..., :2] = self.dobs_origins
+                self.set_dobs_state[..., 2] = self.dobs_height/2
+            else:
+                if self.trace_prob is None:
+                    self.trace_prob = self.cfg.task.trace_prob
+                self.dobs_states[:, 1] = env_utils.update_dobs_vel(self.device, self.dobs_states, 
+                                                                   self.dobs_pos_x_range, self.dobs_pos_y_range, 
+                                                                   self.drone, self.trace_prob, drone_pos_xy=drone_pos_xy)
+                set_dobs_vel = self.dobs_states[:, 1]
+                self.set_dobs_state[..., :2] = self.dobs_states[:, 0] + (set_dobs_vel * self.dt)
+                self.set_dobs_state[..., 2] = self.dobs_height/2
+                self.dobs_states[:, 0] = self.set_dobs_state[..., :2]
+            self.dobs.write_object_link_pose_to_sim(self.set_dobs_state[..., :7])
 
         if self.set_wall_state is None:
             self.set_wall_state = self.wall.data.default_object_state.clone()
             self.set_wall_state[..., :3] = self.wall_origins.reshape(self.wall_num * 4, 3)
             self.wall.write_object_link_pose_to_sim(self.set_wall_state[..., :7])
-
-        # PPO action is normalized in [-1, 1]. Convert to physical target acceleration (m/s^2).
+        # P2M-style action mapping: use raw policy action directly as target_acc input (no scaling/clamp).
         raw_action = tensordict[("agents", "action")]  # shape: [num_envs, 3]
         raw_action = torch.nan_to_num(raw_action, nan=0.0, posinf=0.0, neginf=0.0)
-
-        target_acc = raw_action * self.acc_max        # scale to m/s^2
-        target_acc = torch.clamp(target_acc, self.acc_min, self.acc_max)
-
+        target_acc = raw_action  # P2M behavior: no scaling
         # keep both if you need debug/reward
         self.actions = target_acc
 
-        ego_drone_state = self.drone.get_state(env_frame=False)[..., :13].squeeze(0)
+        ego_drone_state = drone_state_pre[..., :13].squeeze(0)
         unit_thrust = self.controller(ego_drone_state, target_acc.unsqueeze(1), None, False)
         self.effort = self.drone.apply_action(unit_thrust)
 
 
     def _post_sim_step(self, tensordict: TensorDictBase):
-        self.lidar.update(self.dt)
+        # curriculum driver: count global frames (vectorized transitions)
+        self._global_frame_count = int(getattr(self, "_global_frame_count", 0) + int(self.num_envs))
+        # optional lidar update down-sampling (cfg: task.lidar_update_period, default=1)
+        try:
+            period = int(self.cfg.task.get("lidar_update_period", 1))
+        except Exception:
+            period = 1
+        if period <= 1:
+            self.lidar.update(self.dt)
+        else:
+            # update every N steps; pass accumulated dt to keep time-consistency
+            if not hasattr(self, "_lidar_update_counter"):
+                self._lidar_update_counter = 0
+            self._lidar_update_counter += 1
+            if (self._lidar_update_counter % period) == 0:
+                self.lidar.update(self.dt * float(period))
 
     def _compute_state_and_obs(self):
         # Keep locals defined to avoid UnboundLocalError in optional branches / debug.
@@ -504,14 +591,20 @@ class Env(IsaacEnv):
         input_dir_w[..., 1] = sy[:, None] * input_dir[..., 0] + cy[:, None] * input_dir[..., 1]
         input_dir_w[..., 2] = input_dir[..., 2]
 
-        self.dobs_hits_w = env_utils.dobs_lidar_hits(
-            self.lidar_range,
-            self.dobs_height,
-            self.dobs_states,
-            self.lidar.data.pos_w,
-            ray_dir_w,
-            error_tolerance=0.33
-        )
+        if (getattr(self, "dynamic_obs_num", 0) > 0) and (self.dobs_states is not None) and (self.dobs_states.shape[0] > 0):
+            self.dobs_hits_w = env_utils.dobs_lidar_hits(
+                self.lidar_range,
+                self.dobs_height,
+                self.dobs_states,
+                self.lidar.data.pos_w,
+                ray_dir_w,
+                error_tolerance=0.33
+            )
+        else:
+            pos_w = self.lidar.data.pos_w
+            if pos_w.ndim == 3 and pos_w.shape[1] == 1:
+                pos_w = pos_w.squeeze(1)
+            self.dobs_hits_w = pos_w[:, None, :] + ray_dir_w * (self.lidar_range + 1.0)
 
         self.wall_hits_w = env_utils.wall_lidar_hits(
             self.lidar_range,
@@ -841,440 +934,615 @@ class Env(IsaacEnv):
         )
 
 
-def _compute_reward_and_done(self):
-    def _shape_guard(tag, tensor, expect_last=None, expect_ndim=None):
-        n_envs = int(self.num_envs) if not isinstance(self.num_envs, int) else self.num_envs
-        if expect_ndim is not None and tensor.ndim != expect_ndim:
-            raise RuntimeError(f"[shape_guard:{tag}] bad ndim={tensor.ndim}, shape={tuple(tensor.shape)}, n_envs={n_envs}")
-        if tensor.shape[0] != n_envs:
-            raise RuntimeError(f"[shape_guard:{tag}] bad dim0={tensor.shape[0]}, shape={tuple(tensor.shape)}, n_envs={n_envs}")
-        if expect_last is not None and tensor.shape[-1] != expect_last:
-            raise RuntimeError(f"[shape_guard:{tag}] bad last={tensor.shape[-1]}, shape={tuple(tensor.shape)}, n_envs={n_envs}")
+    def _compute_reward_and_done(self):
+        def _shape_guard(tag, tensor, expect_last=None, expect_ndim=None):
+            n_envs = int(self.num_envs) if not isinstance(self.num_envs, int) else self.num_envs
+            if expect_ndim is not None and tensor.ndim != expect_ndim:
+                raise RuntimeError(f"[shape_guard:{tag}] bad ndim={tensor.ndim}, shape={tuple(tensor.shape)}, n_envs={n_envs}")
+            if tensor.shape[0] != n_envs:
+                raise RuntimeError(f"[shape_guard:{tag}] bad dim0={tensor.shape[0]}, shape={tuple(tensor.shape)}, n_envs={n_envs}")
+            if expect_last is not None and tensor.shape[-1] != expect_last:
+                raise RuntimeError(f"[shape_guard:{tag}] bad last={tensor.shape[-1]}, shape={tuple(tensor.shape)}, n_envs={n_envs}")
 
-    def _to_col(tensor):
-        n_envs = int(self.num_envs) if not isinstance(self.num_envs, int) else self.num_envs
-        if tensor.ndim == 1:
+        def _to_col(tensor):
+            n_envs = int(self.num_envs) if not isinstance(self.num_envs, int) else self.num_envs
+            if tensor.ndim == 1:
+                return tensor.view(n_envs, 1)
+            if tensor.ndim == 2 and tensor.shape[-1] == 1:
+                return tensor
             return tensor.view(n_envs, 1)
-        if tensor.ndim == 2 and tensor.shape[-1] == 1:
-            return tensor
-        return tensor.view(n_envs, 1)
 
-    # -------------------------
-    # task / geometry variables
-    # -------------------------
-    distance = self.rpos.norm(dim=-1, keepdim=True)
-    dis2goal = distance.squeeze(-1)
-    height = self.drone_state[..., 2]
+        # -------------------------
+        # task / geometry variables
+        # -------------------------
+        distance = self.rpos.norm(dim=-1, keepdim=True)
+        dis2goal = distance.squeeze(-1)
+        height = self.drone_state[..., 2]
 
-    # goal thresholds
-    touch_goal_dis = float(self.cfg.task.get("touch_goal_dis", 3.0))
-    touch_goal_mask = dis2goal <= touch_goal_dis
-    reach_goal_dis = float(self.cfg.task.get("reach_goal_dis", touch_goal_dis))
-    success_mask = (dis2goal <= reach_goal_dis)
+        # goal thresholds
+        touch_goal_dis = float(self.cfg.task.get("touch_goal_dis", 3.0))
+        touch_goal_mask = dis2goal <= touch_goal_dis
+        reach_goal_dis = float(self.cfg.task.get("reach_goal_dis", touch_goal_dis))
+        success_mask = (dis2goal <= reach_goal_dis)
 
-    # direction to goal (unit)
-    vel_direction = self.rpos / distance.clamp_min(1e-6)
+        # direction to goal (unit)
+        vel_direction = self.rpos / distance.clamp_min(1e-6)
 
-    # drone velocities
-    vel_w = self.drone.vel_w[..., :3]
-    if vel_w.ndim == 3 and vel_w.shape[1] == 1:
-        vel_w = vel_w.squeeze(1)
-    _shape_guard("vel_w", vel_w, expect_last=3, expect_ndim=2)
-    vel_magnitude = vel_w.norm(dim=-1)
-    _shape_guard("vel_magnitude", vel_magnitude, expect_ndim=1)
+        # drone velocities
+        vel_w = self.drone.vel_w[..., :3]
+        if vel_w.ndim == 3 and vel_w.shape[1] == 1:
+            vel_w = vel_w.squeeze(1)
+        _shape_guard("vel_w", vel_w, expect_last=3, expect_ndim=2)
+        vel_magnitude = vel_w.norm(dim=-1)
+        _shape_guard("vel_magnitude", vel_magnitude, expect_ndim=1)
 
-    # action (acceleration command)
-    acc = self.actions
-    acc_magnitude = acc.norm(dim=-1, keepdim=True)
+        # action (acceleration command)
+        acc = self.actions
+        acc_magnitude = acc.norm(dim=-1, keepdim=True)
 
-    if self.last_acc is None:
-        self.last_acc = acc
-    if self.last_dis2goal is None:
-        self.last_dis2goal = dis2goal
+        if self.last_acc is None:
+            self.last_acc = acc
+        if self.last_dis2goal is None:
+            self.last_dis2goal = dis2goal
 
-    # allow overriding some constraints from cfg.task (useful for inference)
-    virtual_ground = float(self.cfg.task.get("virtual_ground", self.virtual_ground))
-    virtual_ceiling = float(self.cfg.task.get("virtual_ceiling", self.virtual_ceiling))
-    self.safety_dis = float(self.cfg.task.get("safety_dis", self.safety_dis))
+        # allow overriding some constraints from cfg.task (useful for inference)
+        virtual_ground = float(self.cfg.task.get("virtual_ground", self.virtual_ground))
+        virtual_ceiling = float(self.cfg.task.get("virtual_ceiling", self.virtual_ceiling))
+        self.safety_dis = float(self.cfg.task.get("safety_dis", self.safety_dis))
 
-    # -------------------------
-    # reward weights
-    # -------------------------
-    rw = self.cfg.task.get("reward_weights", {})
-    k_v = float(rw.get("k_v", 1.2))
-    k_a = float(rw.get("k_a", 0.6))
-    k_j = float(rw.get("k_j", 0.2))
-    k_h = float(rw.get("k_h", 0.3))
-    k_g = float(rw.get("k_g", 0.8))
-    k_s = float(rw.get("k_s", 1.0))
-    k_d = float(rw.get("k_d", 0.6))
+        # -------------------------
+        # reward weights
+        # -------------------------
+        rw = self.cfg.task.get("reward_weights", {})
+        k_v = float(rw.get("k_v", 1.2))
+        k_a = float(rw.get("k_a", 0.6))
+        k_j = float(rw.get("k_j", 0.2))
+        k_h = float(rw.get("k_h", 0.3))
+        k_g = float(rw.get("k_g", 0.8))
+        k_s = float(rw.get("k_s", 1.0))
+        k_d = float(rw.get("k_d", 0.6))
 
-    # -------------------------
-    # state reward components
-    # -------------------------
-    beta_vel, beta_acc = 2.0, 5.0
-    vel_limit = 1.2 * self.vel_max
-    acc_limit = 1.5 * self.acc_max
+        # -------------------------
+        # state reward components
+        # -------------------------
+        beta_vel, beta_acc = 2.0, 5.0
+        vel_limit = 1.2 * self.vel_max
+        acc_limit = 1.5 * self.acc_max
 
-    beta_hei = 2.0
-    hei_set_min = self.fly_height - self.height_bound / 2
-    hei_set_max = self.fly_height + self.height_bound / 2
+        beta_hei = 2.0
+        hei_set_min = self.fly_height - self.height_bound / 2
+        hei_set_max = self.fly_height + self.height_bound / 2
 
-    vel_set_min, vel_set_max = self.vel_min, self.vel_max
-    acc_set_min, acc_set_max = self.acc_min, self.acc_max
+        vel_set_min, vel_set_max = self.vel_min, self.vel_max
+        acc_set_min, acc_set_max = self.acc_min, self.acc_max
 
-    reward_vel, reward_acc, reward_jerk, reward_height = self._compute_state_reward(
-        beta_vel, vel_set_min, vel_set_max, vel_magnitude,
-        beta_acc, acc_set_min, acc_set_max, acc_magnitude,
-        beta_hei, hei_set_min, hei_set_max, height,
-        acc, self.last_acc, touch_goal_mask
-    )
-    reward_vel = reward_vel.view(-1, 1)
-    reward_acc = reward_acc.view(-1, 1)
-    reward_jerk = reward_jerk.view(-1, 1)
-    reward_height = reward_height.view(-1, 1)
+        reward_vel, reward_acc, reward_jerk, reward_height = self._compute_state_reward(
+            beta_vel, vel_set_min, vel_set_max, vel_magnitude,
+            beta_acc, acc_set_min, acc_set_max, acc_magnitude,
+            beta_hei, hei_set_min, hei_set_max, height,
+            acc, self.last_acc, touch_goal_mask
+        )
+        reward_vel = reward_vel.view(-1, 1)
+        reward_acc = reward_acc.view(-1, 1)
+        reward_jerk = reward_jerk.view(-1, 1)
+        reward_height = reward_height.view(-1, 1)
 
-    # goal reward (ungated)
-    reward_goal = self._compute_goal_reward(
-        self.drone.vel_w[..., :3], vel_direction,
-        self.last_dis2goal, dis2goal,
-        touch_goal_mask
-    ).view(-1, 1)
+        # goal reward (ungated)
+        reward_goal = self._compute_goal_reward(
+            self.drone.vel_w[..., :3], vel_direction,
+            self.last_dis2goal, dis2goal,
+            touch_goal_mask
+        ).view(-1, 1)
 
-    # legacy safety rewards (optional to keep for ablation)
-    reward_safety = self._compute_safety_reward(self.lidar_scan)
-    reward_dobs = self._compute_dobs_reward(
-        self.dobs_states,
-        self.drone_state[..., :2].squeeze(1),
-        self.drone.vel_w[..., :2].squeeze(1),
-    )
-
-    # -------------------------
-    # risk scalar + gating / relax
-    # -------------------------
-    risk_gate_goal = bool(self.cfg.task.get("risk_gate_goal", True))
-    risk_relax_enable = bool(self.cfg.task.get("risk_relax_enable", True))
-    risk_reward_enable = bool(self.cfg.task.get("risk_reward_enable", True))
-
-    if risk_gate_goal or risk_relax_enable or risk_reward_enable:
-        radial = getattr(self, "radial_channel", None)
-        risk_smax = self._compute_risk_smax(self.lidar_scan_dis, radial)
-    else:
-        risk_smax = torch.zeros(self.num_envs, device=self.device)
-    risk_smax_col = risk_smax.view(-1, 1)
-
-    # goal gate g(risk)
-    if risk_gate_goal:
-        g_min = float(self.cfg.task.get("risk_gate_g_min", 0.3))
-        g_min = float(max(0.0, min(1.0, g_min)))
-        goal_gate = g_min + (1.0 - g_min) * (1.0 - risk_smax_col)
-        reward_goal = reward_goal * goal_gate
-    else:
-        goal_gate = torch.ones_like(reward_goal)
-
-    # relax jerk & height constraints under high risk (reduce their weights, do not introduce drift)
-    if risk_relax_enable:
-        eta_j = float(self.cfg.task.get("risk_relax_eta_j", 0.5))
-        eta_h = float(self.cfg.task.get("risk_relax_eta_h", 0.5))
-        eta_j = float(max(0.0, min(1.0, eta_j)))
-        eta_h = float(max(0.0, min(1.0, eta_h)))
-        k_j_eff = (k_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
-        k_h_eff = (k_h * (1.0 - eta_h * risk_smax_col)).clamp_min(0.0)
-    else:
-        k_j_eff = torch.full_like(reward_jerk, k_j)
-        k_h_eff = torch.full_like(reward_height, k_h)
-
-    # -------------------------
-    # risk avoidance reward (soft threshold + smooth growth)
-    # -------------------------
-    reward_risk = torch.zeros_like(reward_goal)
-    if risk_reward_enable:
-        rcfg = self.cfg.task.get("risk_cfg", {})
-        alpha = float(rcfg.get("alpha", 10.0))
-        rho0 = float(rcfg.get("rho0", 0.2))
-        w_r = float(rcfg.get("w_r", 1.5))
-
-        # baseline subtraction makes reward_risk=0 when risk_smax=0
-        baseline = F.softplus(torch.tensor(-alpha * rho0, device=self.device))
-        reward_risk = -w_r * (F.softplus(alpha * (risk_smax_col - rho0)) - baseline)
-
-    # -------------------------
-    # total reward (before collision penalty)
-    # -------------------------
-    reward = (
-        k_v * reward_vel
-        + k_a * reward_acc
-        + k_j_eff * reward_jerk
-        + k_h_eff * reward_height
-        + k_g * reward_goal
-        + k_s * reward_safety
-        + k_d * reward_dobs
-        + reward_risk
-    ).view(-1, 1)
-
-    # success bonus (optional)
-    success_bonus = float(self.cfg.task.get("success_bonus", 0.0))
-    if success_bonus != 0.0:
-        reward = reward + success_bonus * success_mask.float().view(-1, 1)
-
-    # time penalty (optional)
-    time_penalty = float(self.cfg.task.get("time_penalty", 0.0))
-    if time_penalty != 0.0:
-        reward = reward - time_penalty
-
-    # -------------------------
-    # termination masks
-    # -------------------------
-    bound_misbehave = env_utils.get_bound_misbehave(
-        self.drone_state[..., :2].squeeze(1),
-        self.start_pos[..., :2].squeeze(1),
-        self.target_pos[..., :2].squeeze(1),
-    )
-    height_low = _to_col(self.drone.pos[..., 2] < virtual_ground)
-    height_high = _to_col(self.drone.pos[..., 2] > virtual_ceiling)
-    bound_misbehave = _to_col(bound_misbehave)
-    vel_limit_mask = _to_col(vel_magnitude > vel_limit)
-    acc_limit_mask = _to_col(acc.abs().amax(dim=-1, keepdim=True) > acc_limit)
-
-    # nearest obstacle distance
-    min_depth_map = torch.where(
-        self.lidar_scan_dis <= 1e-6,
-        torch.full_like(self.lidar_scan_dis, self.lidar_range),
-        self.lidar_scan_dis,
-    )
-    min_depth = einops.reduce(min_depth_map, "n 1 w h -> n 1", "min")
-    safety_mask = _to_col(min_depth < self.safety_dis)
-
-    misbehave = (
-        height_low
-        | height_high
-        | bound_misbehave
-        | vel_limit_mask
-        | acc_limit_mask
-        | safety_mask
-    )
-
-    hasnan = _to_col(torch.isnan(self.drone_state).any(-1))
-    terminated_base = misbehave | hasnan
-
-    terminate_on_success = bool(self.cfg.task.get("terminate_on_success", False))
-    terminated = terminated_base
-    if terminate_on_success:
-        terminated = terminated_base | success_mask
-
-    truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
-
-    # -------------------------
-    # collision penalty (does not replace risk shaping)
-    # -------------------------
-    reward_collision = torch.zeros_like(reward)
-    collision_penalty = float(self.cfg.task.get("collision_penalty", 0.0))
-    if collision_penalty != 0.0:
-        collision_include_height = bool(self.cfg.task.get("collision_include_height", True))
-        collision_mask = safety_mask
-        if collision_include_height:
-            collision_mask = collision_mask | height_low | height_high
-        reward_collision = -collision_penalty * collision_mask.float()
-        reward = reward + reward_collision
-
-    # -------------------------
-    # optional debug prints (OFF by default; printing is expensive)
-    # -------------------------
-    if self.cfg.task.get("debug_print_reward", False) and (int(self.progress_buf[0].item()) % 50) == 0:
-        print(
-            f"\r vel: {(k_v * reward_vel[0]).item():.3f}, "
-            f"acc: {(k_a * reward_acc[0]).item():.3f}, "
-            f"jerk: {(k_j_eff[0] * reward_jerk[0]).item():.3f}, "
-            f"height: {(k_h_eff[0] * reward_height[0]).item():.3f}, "
-            f"goal: {(k_g * reward_goal[0]).item():.3f}, "
-            f"gate: {goal_gate[0].item():.3f}, "
-            f"risk: {reward_risk[0].item():.3f}, "
-            f"safety: {(k_s * reward_safety[0]).item():.3f}, "
-            f"dobs: {(k_d * reward_dobs[0]).item():.3f}, "
-            f"coll: {reward_collision[0].item():.3f}, "
-            f"total: {reward[0].item():.3f}\r",
-            end="",
-            flush=True,
+        # legacy safety rewards (optional to keep for ablation)
+        reward_safety = self._compute_safety_reward(self.lidar_scan)
+        reward_dobs = self._compute_dobs_reward(
+            self.dobs_states,
+            self.drone_state[..., :2].squeeze(1),
+            self.drone.vel_w[..., :2].squeeze(1),
         )
 
-    # -------------------------
-    # stats update
-    # -------------------------
-    self.stats["reward_velocity"].add_(reward_vel)
-    self.stats["reward_acceleration"].add_(reward_acc)
-    self.stats["reward_jerk"].add_(reward_jerk)
-    self.stats["reward_height"].add_(reward_height)
-    self.stats["reward_goal"].add_(reward_goal)
-    self.stats["reward_safety"].add_(reward_safety)
-    self.stats["reward_dobs"].add_(reward_dobs)
-    self.stats["reward_risk"].add_(reward_risk)
-    self.stats["reward_collision"].add_(reward_collision)
+        # -------------------------
+        # risk scalar + gating / relax
+        # -------------------------
+        risk_gate_goal = bool(self.cfg.task.get("risk_gate_goal", True))
+        risk_relax_enable = bool(self.cfg.task.get("risk_relax_enable", True))
+        risk_reward_enable = bool(self.cfg.task.get("risk_reward_enable", True))
 
-    # scalar diagnostics (store current-step values, not accumulated sums)
-    self.stats["risk_smax"].copy_(risk_smax_col)
-    self.stats["goal_gate"].copy_(goal_gate)
+        if risk_gate_goal or risk_relax_enable or risk_reward_enable:
+            radial = getattr(self, "radial_channel", None)
+            risk_smax = self._compute_risk_smax(self.lidar_scan_dis, radial)
+        else:
+            risk_smax = torch.zeros(self.num_envs, device=self.device)
+        risk_smax_col = risk_smax.view(-1, 1)
 
-    vel_magnitude_col = vel_magnitude.view(self.num_envs, 1)
-    step_count = self.progress_buf.clamp_min(1.0).unsqueeze(1)
-    self.speed_sum.add_(vel_magnitude_col)
-    self.acc_sum.add_(acc_magnitude)
-    self.stats["avg_speed"] = self.speed_sum / step_count
-    self.stats["avg_acc"] = self.acc_sum / step_count
-    self.stats["max_speed"] = torch.maximum(self.stats["max_speed"], vel_magnitude_col)
-    self.stats["max_acc"] = torch.maximum(self.stats["max_acc"], acc_magnitude)
+        # goal gate g(risk)
+        if risk_gate_goal:
+            g_min = float(self.cfg.task.get("risk_gate_g_min", 0.3))
+            g_min = float(max(0.0, min(1.0, g_min)))
+            goal_gate = g_min + (1.0 - g_min) * (1.0 - risk_smax_col)
+            reward_goal = reward_goal * goal_gate
+        else:
+            goal_gate = torch.ones_like(reward_goal)
 
-    self.stats["return"] += reward
-    self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
+        # relax jerk & height constraints under high risk (reduce their weights, do not introduce drift)
+        if risk_relax_enable:
+            eta_j = float(self.cfg.task.get("risk_relax_eta_j", 0.5))
+            eta_h = float(self.cfg.task.get("risk_relax_eta_h", 0.5))
+            eta_j = float(max(0.0, min(1.0, eta_j)))
+            eta_h = float(max(0.0, min(1.0, eta_h)))
+            k_j_eff = (k_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
+            k_h_eff = (k_h * (1.0 - eta_h * risk_smax_col)).clamp_min(0.0)
+        else:
+            k_j_eff = torch.full_like(reward_jerk, k_j)
+            k_h_eff = torch.full_like(reward_height, k_h)
 
-    self.last_acc = acc
-    self.last_dis2goal = dis2goal
+        # -------------------------
+        # risk avoidance reward (soft threshold + smooth growth)
+        # -------------------------
+        reward_risk = torch.zeros_like(reward_goal)
+        if risk_reward_enable:
+            rcfg = self.cfg.task.get("risk_cfg", {})
+            alpha = float(rcfg.get("alpha", 10.0))
+            rho0 = float(rcfg.get("rho0", 0.2))
+            # base weight
+            w_r = float(rcfg.get("w_r", 1.5))
 
-    plan_success = success_mask
-    flight_success = success_mask & (~terminated_base) & (~truncated)
-    self.stats["plan_success"] = plan_success.float()
-    self.stats["flight_success"] = flight_success.float()
+            # optional curriculum: linearly interpolate w_r over global frames
+            # risk_cfg: {w_r_start, w_r_end, w_r_steps}
+            if ("w_r_start" in rcfg) and ("w_r_end" in rcfg) and ("w_r_steps" in rcfg):
+                try:
+                    w_r_start = float(rcfg.get("w_r_start"))
+                    w_r_end = float(rcfg.get("w_r_end"))
+                    w_r_steps = float(rcfg.get("w_r_steps"))
+                    w_r_steps = max(w_r_steps, 1.0)
+                    frames = float(getattr(self, "_global_frame_count", 0))
+                    t = max(0.0, min(1.0, frames / w_r_steps))
+                    w_r = w_r_start + (w_r_end - w_r_start) * t
+                except Exception:
+                    pass
 
-    assert terminated.shape == (self.num_envs, 1), terminated.shape
-    assert truncated.shape == (self.num_envs, 1), truncated.shape
 
-    if self.cfg.task.get("debug_print_done", False) and int(self.progress_buf[0].item()) % 50 == 0:
-        term_rate = float(terminated.float().mean().item())
-        trunc_rate = float(truncated.float().mean().item())
-        print(f"[DONE] term_rate={term_rate:.3f} trunc_rate={trunc_rate:.3f}")
+            # baseline subtraction makes reward_risk=0 when risk_smax=0
+            baseline = F.softplus(torch.tensor(-alpha * rho0, device=self.device))
+            reward_risk = -w_r * (F.softplus(alpha * (risk_smax_col - rho0)) - baseline)
 
-    return TensorDict(
-        {
-            "agents": {
-                "reward": reward,
+        # -------------------------
+        # total reward (before collision penalty)
+        # -------------------------
+        reward = (
+            k_v * reward_vel
+            + k_a * reward_acc
+            + k_j_eff * reward_jerk
+            + k_h_eff * reward_height
+            + k_g * reward_goal
+            + k_s * reward_safety
+            + k_d * reward_dobs
+            + reward_risk
+        ).view(-1, 1)
+
+        # success bonus (optional)
+        success_bonus = float(self.cfg.task.get("success_bonus", 0.0))
+        if success_bonus != 0.0:
+            reward = reward + success_bonus * success_mask.float().view(-1, 1)
+
+        # time penalty (optional)
+        time_penalty = float(self.cfg.task.get("time_penalty", 0.0))
+        if time_penalty != 0.0:
+            reward = reward - time_penalty
+
+        # -------------------------
+        # termination masks
+        # -------------------------
+        bound_misbehave = env_utils.get_bound_misbehave(
+            self.drone_state[..., :2].squeeze(1),
+            self.start_pos[..., :2].squeeze(1),
+            self.target_pos[..., :2].squeeze(1),
+        )
+        height_low = _to_col(self.drone.pos[..., 2] < virtual_ground)
+        height_high = _to_col(self.drone.pos[..., 2] > virtual_ceiling)
+        bound_misbehave = _to_col(bound_misbehave)
+        vel_limit_mask = _to_col(vel_magnitude > vel_limit)
+        acc_limit_mask = _to_col(acc.abs().amax(dim=-1, keepdim=True) > acc_limit)
+
+        # nearest obstacle distance
+        min_depth_map = torch.where(
+            self.lidar_scan_dis <= 1e-6,
+            torch.full_like(self.lidar_scan_dis, self.lidar_range),
+            self.lidar_scan_dis,
+        )
+        min_depth = einops.reduce(min_depth_map, "n 1 w h -> n 1", "min")
+        safety_mask = _to_col(min_depth < self.safety_dis)
+
+        # termination toggles (training can choose to penalize instead of terminate)
+        try:
+            terminate_on_height_high = bool(self.cfg.task.get("terminate_on_height_high", True))
+            terminate_on_vel_limit = bool(self.cfg.task.get("terminate_on_vel_limit", True))
+        except Exception:
+            terminate_on_height_high = True
+            terminate_on_vel_limit = True
+
+        zero = torch.zeros_like(height_low)
+        height_high_term = height_high if terminate_on_height_high else zero
+        vel_limit_term = vel_limit_mask if terminate_on_vel_limit else zero
+
+        # penalties when not terminating (optional)
+        if not terminate_on_height_high:
+            pen = float(self.cfg.task.get("height_high_penalty", 0.0))
+            if pen != 0.0:
+                reward = reward - pen * height_high.float()
+        if not terminate_on_vel_limit:
+            pen = float(self.cfg.task.get("vel_limit_penalty", 0.0))
+            if pen != 0.0:
+                reward = reward - pen * vel_limit_mask.float()
+
+        misbehave = (
+            height_low
+            | height_high_term
+            | bound_misbehave
+            | vel_limit_term
+            | acc_limit_mask
+            | safety_mask
+        )
+
+        hasnan = _to_col(torch.isnan(self.drone_state).any(-1))
+        terminated_base = misbehave | hasnan
+
+        terminate_on_success = bool(self.cfg.task.get("terminate_on_success", False))
+        terminated = terminated_base
+        if terminate_on_success:
+            terminated = terminated_base | success_mask
+
+        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
+
+        # -------------------------
+        # termination reason breakdown (step-level; exclusive by priority)
+        # -------------------------
+        done_any = terminated | truncated
+
+        # success termination only if terminate_on_success is enabled
+        done_success = success_mask if terminate_on_success else torch.zeros_like(done_any)
+        used = done_success.clone()
+
+        done_safety = done_any & safety_mask & (~used)
+        used = used | done_safety
+
+        done_height_low = done_any & height_low & (~used)
+        used = used | done_height_low
+
+        done_height_high = done_any & height_high & (~used)
+        used = used | done_height_high
+
+        done_bound = done_any & bound_misbehave & (~used)
+        used = used | done_bound
+
+        done_vel_limit = done_any & vel_limit_mask & (~used)
+        used = used | done_vel_limit
+
+        done_acc_limit = done_any & acc_limit_mask & (~used)
+        used = used | done_acc_limit
+
+        done_nan = done_any & hasnan & (~used)
+        used = used | done_nan
+
+        done_timeout = done_any & truncated & (~used)
+        used = used | done_timeout
+
+        done_other = done_any & (~used)
+
+        # step-level ratios over done events (avoid .item() to prevent CPU sync)
+        done_count = done_any.float().sum().clamp_min(1.0)
+        done_rate = done_any.float().mean()
+
+        ratio_success = done_success.float().sum() / done_count
+        ratio_timeout = done_timeout.float().sum() / done_count
+        ratio_safety = done_safety.float().sum() / done_count
+        ratio_height_low = done_height_low.float().sum() / done_count
+        ratio_height_high = done_height_high.float().sum() / done_count
+        ratio_bound = done_bound.float().sum() / done_count
+        ratio_vel_limit = done_vel_limit.float().sum() / done_count
+        ratio_acc_limit = done_acc_limit.float().sum() / done_count
+        ratio_nan = done_nan.float().sum() / done_count
+        ratio_other = done_other.float().sum() / done_count
+
+        # write stats (0/1 masks are per-env; ratios are global scalars broadcast to all env slots)
+        self.stats["terminated"].copy_(terminated.float())
+        self.stats["truncated"].copy_(truncated.float())
+        self.stats["done_any"].copy_(done_any.float())
+        self.stats["done_success"].copy_(done_success.float())
+        self.stats["done_timeout"].copy_(done_timeout.float())
+        self.stats["done_safety"].copy_(done_safety.float())
+        self.stats["done_height_low"].copy_(done_height_low.float())
+        self.stats["done_height_high"].copy_(done_height_high.float())
+        self.stats["done_bound"].copy_(done_bound.float())
+        self.stats["done_vel_limit"].copy_(done_vel_limit.float())
+        self.stats["done_acc_limit"].copy_(done_acc_limit.float())
+        self.stats["done_nan"].copy_(done_nan.float())
+        self.stats["done_other"].copy_(done_other.float())
+
+        self.stats["done_rate"][:] = done_rate
+        self.stats["done_ratio_success"][:] = ratio_success
+        self.stats["done_ratio_timeout"][:] = ratio_timeout
+        self.stats["done_ratio_safety"][:] = ratio_safety
+        self.stats["done_ratio_height_low"][:] = ratio_height_low
+        self.stats["done_ratio_height_high"][:] = ratio_height_high
+        self.stats["done_ratio_bound"][:] = ratio_bound
+        self.stats["done_ratio_vel_limit"][:] = ratio_vel_limit
+        self.stats["done_ratio_acc_limit"][:] = ratio_acc_limit
+        self.stats["done_ratio_nan"][:] = ratio_nan
+        self.stats["done_ratio_other"][:] = ratio_other
+
+
+        # -------------------------
+        # collision penalty (does not replace risk shaping)
+        # -------------------------
+        reward_collision = torch.zeros_like(reward)
+        collision_penalty = float(self.cfg.task.get("collision_penalty", 0.0))
+        if collision_penalty != 0.0:
+            collision_include_height = bool(self.cfg.task.get("collision_include_height", True))
+            collision_mask = safety_mask
+            if collision_include_height:
+                collision_mask = collision_mask | height_low | height_high
+            reward_collision = -collision_penalty * collision_mask.float()
+            reward = reward + reward_collision
+
+        # -------------------------
+        # optional debug prints (OFF by default; printing is expensive)
+        # -------------------------
+        if self.cfg.task.get("debug_print_reward", False) and (int(self.progress_buf[0].item()) % 50) == 0:
+            print(
+                f"\r vel: {(k_v * reward_vel[0]).item():.3f}, "
+                f"acc: {(k_a * reward_acc[0]).item():.3f}, "
+                f"jerk: {(k_j_eff[0] * reward_jerk[0]).item():.3f}, "
+                f"height: {(k_h_eff[0] * reward_height[0]).item():.3f}, "
+                f"goal: {(k_g * reward_goal[0]).item():.3f}, "
+                f"gate: {goal_gate[0].item():.3f}, "
+                f"risk: {reward_risk[0].item():.3f}, "
+                f"safety: {(k_s * reward_safety[0]).item():.3f}, "
+                f"dobs: {(k_d * reward_dobs[0]).item():.3f}, "
+                f"coll: {reward_collision[0].item():.3f}, "
+                f"total: {reward[0].item():.3f}\r",
+                end="",
+                flush=True,
+            )
+
+        # -------------------------
+        # stats update
+        # -------------------------
+        self.stats["reward_velocity"].add_(reward_vel)
+        self.stats["reward_acceleration"].add_(reward_acc)
+        self.stats["reward_jerk"].add_(reward_jerk)
+        self.stats["reward_height"].add_(reward_height)
+        self.stats["reward_goal"].add_(reward_goal)
+        self.stats["reward_safety"].add_(reward_safety)
+        self.stats["reward_dobs"].add_(reward_dobs)
+        self.stats["reward_risk"].add_(reward_risk)
+        self.stats["reward_collision"].add_(reward_collision)
+
+        # scalar diagnostics (store current-step values, not accumulated sums)
+        self.stats["risk_smax"].copy_(risk_smax_col)
+        self.stats["goal_gate"].copy_(goal_gate)
+
+        vel_magnitude_col = vel_magnitude.view(self.num_envs, 1)
+        step_count = self.progress_buf.clamp_min(1.0).unsqueeze(1)
+        self.speed_sum.add_(vel_magnitude_col)
+        self.acc_sum.add_(acc_magnitude)
+        self.stats["avg_speed"] = self.speed_sum / step_count
+        self.stats["avg_acc"] = self.acc_sum / step_count
+        self.stats["max_speed"] = torch.maximum(self.stats["max_speed"], vel_magnitude_col)
+        self.stats["max_acc"] = torch.maximum(self.stats["max_acc"], acc_magnitude)
+
+        self.stats["return"] += reward
+        self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
+
+        self.last_acc = acc
+        self.last_dis2goal = dis2goal
+
+        plan_success = success_mask
+        flight_success = success_mask & (~terminated_base) & (~truncated)
+        self.stats["plan_success"] = plan_success.float()
+        self.stats["flight_success"] = flight_success.float()
+
+        assert terminated.shape == (self.num_envs, 1), terminated.shape
+        assert truncated.shape == (self.num_envs, 1), truncated.shape
+
+        if self.cfg.task.get("debug_print_done", False) and int(self.progress_buf[0].item()) % 50 == 0:
+            term_rate = float(terminated.float().mean().item())
+            trunc_rate = float(truncated.float().mean().item())
+            print(f"[DONE] term_rate={term_rate:.3f} trunc_rate={trunc_rate:.3f}")
+
+        return TensorDict(
+            {
+                "agents": {
+                    "reward": reward,
+                },
+                "stats": self.stats.clone(),
+                "done": terminated | truncated,
+                "terminated": terminated,
+                "truncated": truncated,
             },
-            "stats": self.stats.clone(),
-            "done": terminated | truncated,
-            "terminated": terminated,
-            "truncated": truncated,
-        },
-        self.batch_size,
-    )
+            self.batch_size,
+        )
 
     def _compute_state_reward(self, beta_vel, vel_set_min, vel_set_max, vel_magnitude,
-                              beta_acc, acc_set_min, acc_set_max, acc_magnitude,
-                              beta_hei, hei_set_min, hei_set_max, height, 
-                              acc, last_acc, touch_goal_mask):
+                            beta_acc, acc_set_min, acc_set_max, acc_magnitude,
+                            beta_hei, hei_set_min, hei_set_max, height, 
+                            acc, last_acc, touch_goal_mask):
         if vel_magnitude.ndim == 2 and vel_magnitude.shape[-1] == 1:
             vel_magnitude = vel_magnitude.squeeze(-1)
         if touch_goal_mask.ndim == 2 and touch_goal_mask.shape[-1] == 1:
             touch_goal_mask = touch_goal_mask.squeeze(-1)
         reward_vel = torch.log(torch.exp(- beta_vel * (torch.clamp(vel_set_min - vel_magnitude, min = 0.)
-                                         + torch.clamp(vel_magnitude - vel_set_max, min = 0.))) + 1.)
+                                        + torch.clamp(vel_magnitude - vel_set_max, min = 0.))) + 1.)
         reward_vel[touch_goal_mask] = torch.log(torch.exp(- beta_vel * torch.clamp(
-                                         vel_magnitude[touch_goal_mask] - vel_set_max, min = 0.)) + 1.)
+                                        vel_magnitude[touch_goal_mask] - vel_set_max, min = 0.)) + 1.)
         reward_acc = torch.log(torch.exp(- beta_acc * (torch.clamp(acc_set_min - acc_magnitude, min = 0.)
-                                         + torch.clamp(acc_magnitude - acc_set_max, min = 0.))) + 1.)
+                                        + torch.clamp(acc_magnitude - acc_set_max, min = 0.))) + 1.)
         reward_jerk = 1. / (1. + torch.norm(acc - last_acc, dim=-1, keepdim=True))
         reward_height = torch.log(torch.exp(- beta_hei * (torch.clamp(hei_set_min - height, min = 0.)
-                                         + torch.clamp(height - hei_set_max, min = 0.))) + 1.)
+                                        + torch.clamp(height - hei_set_max, min = 0.))) + 1.)
 
         return reward_vel, reward_acc, reward_jerk, reward_height
 
-def _compute_goal_reward(self, vel_vector, vel_direction, last_dis2goal, dis2goal, touch_goal_mask):
-    """Goal progress reward.
+    def _compute_goal_reward(self, vel_vector, vel_direction, last_dis2goal, dis2goal, touch_goal_mask):
+        """Goal progress reward.
 
-    Controlled by cfg.task.goal_reward_type:
-      - 'linear' (recommended): w_d*(d_prev - d_now) + w_theta*cos(theta)
-      - 'exp' (legacy): direction + 10*(exp(Δd) - 1), where Δd = d_prev - d_now
-    """
-    goal_type = str(self.cfg.task.get("goal_reward_type", "exp")).lower()
+        Controlled by cfg.task.goal_reward_type:
+        - 'linear' (recommended): w_d*(d_prev - d_now) + w_theta*cos(theta)
+        - 'exp' (legacy): direction + 10*(exp(Δd) - 1), where Δd = d_prev - d_now
+        """
+        goal_type = str(self.cfg.task.get("goal_reward_type", "exp")).lower()
 
-    # squeeze common shapes
-    if vel_vector.ndim == 3 and vel_vector.shape[1] == 1:
-        vel_vec = vel_vector.squeeze(1)
-    else:
-        vel_vec = vel_vector
-    if vel_direction.ndim == 3 and vel_direction.shape[1] == 1:
-        vel_dir = vel_direction.squeeze(1)
-    else:
-        vel_dir = vel_direction
+        # squeeze common shapes
+        if vel_vector.ndim == 3 and vel_vector.shape[1] == 1:
+            vel_vec = vel_vector.squeeze(1)
+        else:
+            vel_vec = vel_vector
+        if vel_direction.ndim == 3 and vel_direction.shape[1] == 1:
+            vel_dir = vel_direction.squeeze(1)
+        else:
+            vel_dir = vel_direction
 
-    last_d = last_dis2goal.squeeze(-1) if last_dis2goal.ndim == 2 else last_dis2goal
-    d_now = dis2goal.squeeze(-1) if dis2goal.ndim == 2 else dis2goal
-    touch_mask = touch_goal_mask.squeeze(-1) if (touch_goal_mask.ndim == 2 and touch_goal_mask.shape[-1] == 1) else touch_goal_mask
+        last_d = last_dis2goal.squeeze(-1) if last_dis2goal.ndim == 2 else last_dis2goal
+        d_now = dis2goal.squeeze(-1) if dis2goal.ndim == 2 else dis2goal
+        touch_mask = touch_goal_mask.squeeze(-1) if (touch_goal_mask.ndim == 2 and touch_goal_mask.shape[-1] == 1) else touch_goal_mask
 
-    if goal_type == "linear":
-        w_d = float(self.cfg.task.get("goal_w_d", 10.0))
-        w_theta = float(self.cfg.task.get("goal_w_theta", 1.0))
+        if goal_type == "linear":
+            w_d = float(self.cfg.task.get("goal_w_d", 10.0))
+            w_theta = float(self.cfg.task.get("goal_w_theta", 1.0))
 
-        progress = (last_d - d_now).clamp(min=-1.0, max=1.0)
+            # progress shaping (delta distance). Support optional scaling / dt normalization.
+            progress = (last_d - d_now)
+            try:
+                progress_scale = float(self.cfg.task.get("goal_progress_scale", 1.0))
+            except Exception:
+                progress_scale = 1.0
+            progress = progress * progress_scale
 
-        speed = vel_vec.norm(dim=-1).clamp_min(1e-6)
-        v_dir = vel_vec / speed.unsqueeze(-1)
-        cos_theta = (v_dir * vel_dir).sum(-1).clamp(-1.0, 1.0)
+            # Plan A option: normalize by dt (turn into progress speed)
+            try:
+                scale_by_dt = bool(self.cfg.task.get("goal_progress_scale_by_dt", False))
+            except Exception:
+                scale_by_dt = False
+            if scale_by_dt:
+                dt = float(getattr(self, "dt", 0.0))
+                if dt > 1e-6:
+                    progress = progress / dt
 
-        reward_goal = w_d * progress + w_theta * cos_theta
-        reward_goal[touch_mask] = 0.0
+            # clamp to avoid extreme spikes
+            try:
+                clamp_val = float(self.cfg.task.get("goal_progress_clamp", 1.0))
+            except Exception:
+                clamp_val = 1.0
+            if clamp_val > 0:
+                progress = progress.clamp(min=-clamp_val, max=clamp_val)
+
+
+            speed = vel_vec.norm(dim=-1).clamp_min(1e-6)
+            v_dir = vel_vec / speed.unsqueeze(-1)
+            cos_theta = (v_dir * vel_dir).sum(-1).clamp(-1.0, 1.0)
+
+            reward_goal = w_d * progress + w_theta * cos_theta
+            reward_goal[touch_mask] = 0.0
+            return reward_goal
+
+        # legacy exp shaping (default)
+        reward_goal_dir = (vel_vec * vel_dir).sum(-1).clip(max=2.0)
+        delta_dis = (last_d - d_now).clamp(min=-3.0, max=3.0)
+        reward_goal_dis = (torch.exp(delta_dis) - 1.0) * 10.0
+        reward_goal_dis[touch_mask] = 0.0
+        reward_goal = reward_goal_dir + reward_goal_dis
         return reward_goal
 
-    # legacy exp shaping (default)
-    reward_goal_dir = (vel_vec * vel_dir).sum(-1).clip(max=2.0)
-    delta_dis = (last_d - d_now).clamp(min=-3.0, max=3.0)
-    reward_goal_dis = (torch.exp(delta_dis) - 1.0) * 10.0
-    reward_goal_dis[touch_mask] = 0.0
-    reward_goal = reward_goal_dir + reward_goal_dis
-    return reward_goal
+        
 
-    
+    def _compute_risk_smax(self, lidar_scan_dis: torch.Tensor, radial_channel: torch.Tensor) -> torch.Tensor:
+        """Compute differentiable global risk scalar R^{smax} in [0, 1].
 
-def _compute_risk_smax(self, lidar_scan_dis: torch.Tensor, radial_channel: torch.Tensor) -> torch.Tensor:
-    """Compute differentiable global risk scalar R^{smax} in [0, 1].
+        Per-sector risk is defined as:
+            TTC^{ij} = r^{ij} / max(v_c^{ij}, v_min)
+            H^{ij}   = clip(T0 / TTC^{ij}, 0, 1)
 
-    Per-sector risk is defined as:
-        TTC^{ij} = r^{ij} / max(v_c^{ij}, v_min)
-        H^{ij}   = clip(T0 / TTC^{ij}, 0, 1)
+        We aggregate H using a masked softmax to preserve max-like behavior while keeping
+        the mapping smooth and differentiable.
+        """
+        if lidar_scan_dis.ndim == 3:
+            lidar_scan_dis = lidar_scan_dis.unsqueeze(1)
 
-    We aggregate H using a masked softmax to preserve max-like behavior while keeping
-    the mapping smooth and differentiable.
-    """
-    if lidar_scan_dis.ndim == 3:
-        lidar_scan_dis = lidar_scan_dis.unsqueeze(1)
+        if radial_channel is None:
+            radial_channel = torch.zeros_like(lidar_scan_dis)
+        elif radial_channel.ndim == 3:
+            radial_channel = radial_channel.unsqueeze(1)
+        elif radial_channel.ndim == 4 and radial_channel.size(1) != 1:
+            radial_channel = radial_channel[:, :1, ...]
 
-    if radial_channel is None:
-        radial_channel = torch.zeros_like(lidar_scan_dis)
-    elif radial_channel.ndim == 3:
-        radial_channel = radial_channel.unsqueeze(1)
-    elif radial_channel.ndim == 4 and radial_channel.size(1) != 1:
-        radial_channel = radial_channel[:, :1, ...]
+        rcfg = self.cfg.task.get("risk_cfg", {})
+        T0 = float(rcfg.get("T0", 3.0))
+        v_min = float(rcfg.get("v_min", 0.1))
+        beta = float(rcfg.get("beta", 10.0))
 
-    rcfg = self.cfg.task.get("risk_cfg", {})
-    T0 = float(rcfg.get("T0", 3.0))
-    v_min = float(rcfg.get("v_min", 0.1))
-    beta = float(rcfg.get("beta", 10.0))
+        max_range = rcfg.get("max_range", None)
+        if max_range is None:
+            max_range = float(self.cfg.task.get("lidar_effective_range", self.lidar_range))
+        max_range = min(float(max_range), float(self.lidar_range))
 
-    max_range = rcfg.get("max_range", None)
-    if max_range is None:
-        max_range = float(self.cfg.task.get("lidar_effective_range", self.lidar_range))
-    max_range = min(float(max_range), float(self.lidar_range))
+        # closing speed (m/s)
+        #   closing = ego_closing_along_ray + residual_closing_from_dynamic_obstacles
+        # residual closing: radial channel is normalized by lidar_radial_max_speed
+        radial_speed = radial_channel.float() * float(self.lidar_radial_max_speed)
 
-    # closing speed (m/s), radial channel is normalized by lidar_radial_max_speed
-    radial_speed = radial_channel.float() * float(self.lidar_radial_max_speed)
-    closing = torch.maximum(radial_speed, radial_speed.new_tensor(v_min))
+        # --- ego velocity projection onto rays (covers static obstacles) ---
+        ego_closing = torch.zeros_like(lidar_scan_dis)
+        ray_dir = getattr(self, "input_dir", None)
+        if ray_dir is not None:
+            # ray_dir is in yaw-only lidar frame (attach_yaw_only)
+            ray_dir_flat = ray_dir.reshape(ray_dir.shape[0], -1, 3).float()
 
-    r = lidar_scan_dis.clamp_min(1e-3)
-    H = (T0 * closing / r).clamp(0.0, 1.0)
+            # drone velocity in yaw-only frame
+            vel_w = self.drone.vel_w[..., :3]
+            if vel_w.ndim == 3 and vel_w.shape[1] == 1:
+                vel_w = vel_w.squeeze(1)
 
-    # mask out very far cells (avoid gradient dilution)
-    mask = lidar_scan_dis < max_range
-    H = torch.where(mask, H, torch.zeros_like(H))
+            rot = self.drone_state[..., 3:7]
+            if rot.ndim == 3 and rot.shape[1] == 1:
+                rot = rot.squeeze(1)
+            yaw = quaternion_to_euler(rot)[..., 2]
+            zeros = torch.zeros_like(yaw)
+            q_yaw = euler_to_quaternion(torch.stack([zeros, zeros, yaw], dim=-1))
+            vel_yaw = quat_rotate_inverse(q_yaw, vel_w)
 
-    H_flat = H.view(H.shape[0], -1)
-    mask_flat = mask.view(mask.shape[0], -1)
+            ego_proj = (vel_yaw.unsqueeze(1) * ray_dir_flat).sum(dim=-1)
+            ego_proj = torch.clamp(ego_proj, min=0.0)
+            ego_closing = ego_proj.reshape(lidar_scan_dis.shape[0], 1, *self.lidar_resolution)
 
-    logits = beta * H_flat
-    logits = logits.masked_fill(~mask_flat, -1e9)
+        closing_raw = ego_closing + radial_speed
+        closing_pos = torch.clamp(closing_raw, min=0.0)
+        # only apply v_min when approaching; otherwise keep 0 to avoid false risk
+        closing = torch.where(
+            closing_pos > 0.0,
+            torch.maximum(closing_pos, closing_pos.new_tensor(v_min)),
+            torch.zeros_like(closing_pos),
+        )
 
-    pi = torch.softmax(logits, dim=-1)
-    pi = pi * mask_flat.float()
-    pi = pi / pi.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        r = lidar_scan_dis.clamp_min(1e-3)
+        H = (T0 * closing / r).clamp(0.0, 1.0)
 
-    risk_smax = (pi * H_flat).sum(dim=-1)
-    return risk_smax
+        # mask out very far cells (avoid gradient dilution)
+        mask = lidar_scan_dis < max_range
+        H = torch.where(mask, H, torch.zeros_like(H))
+
+        H_flat = H.view(H.shape[0], -1)
+        mask_flat = mask.view(mask.shape[0], -1)
+
+        logits = beta * H_flat
+        logits = logits.masked_fill(~mask_flat, -1e9)
+
+        pi = torch.softmax(logits, dim=-1)
+        pi = pi * mask_flat.float()
+        pi = pi / pi.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        risk_smax = (pi * H_flat).sum(dim=-1)
+        return risk_smax
 
     def _compute_safety_reward(self, lidar_scan: torch.Tensor) -> torch.Tensor:
         """Safety reward (P2M legacy logic).
@@ -1313,6 +1581,9 @@ def _compute_risk_smax(self, lidar_scan_dis: torch.Tensor, radial_channel: torch
     def _compute_dobs_reward(self, obstacle_tensor, drone_pos, drone_vel):
         num_env = drone_pos.shape[0]
         n = obstacle_tensor.shape[0]
+        if n == 0:
+            # dynamic_obs_num=0 safety: no dynamic obstacles => no dobs reward/penalty
+            return torch.zeros((num_env, 1), device=self.device)
         pos = obstacle_tensor[:, 0]
         vel = obstacle_tensor[:, 1]
         rad = obstacle_tensor[:, 2, 0]

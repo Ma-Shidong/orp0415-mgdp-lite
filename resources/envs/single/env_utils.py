@@ -69,7 +69,7 @@ def compute_rayhitsdir(device, num_envs, h_fov, v_fov, h_num, v_num):
 
     return ray_hits_dir
 
-def update_dobs_vel(device, dobs_states, dobs_pos_x_range, dobs_pos_y_range, drone, trace_prob):
+def update_dobs_vel(device, dobs_states, dobs_pos_x_range, dobs_pos_y_range, drone, trace_prob, drone_pos_xy=None):
     touch_bound_x_lower = dobs_states[:, 0][:, 0] < dobs_pos_x_range[0]
     touch_bound_x_upper = dobs_states[:, 0][:, 0] > dobs_pos_x_range[1]  
     touch_bound_y_lower = dobs_states[:, 0][:, 1] < dobs_pos_y_range[0]  
@@ -77,12 +77,13 @@ def update_dobs_vel(device, dobs_states, dobs_pos_x_range, dobs_pos_y_range, dro
     touch_bound = (
         touch_bound_x_lower | touch_bound_x_upper | touch_bound_y_lower | touch_bound_y_upper).to(device)
 
-    if not touch_bound.any():
-        return dobs_states[:, 1, :]
-    
     obs_pos = dobs_states[:, 0, :]
     obs_vel = dobs_states[:, 1, :] 
-    drone_pos_xy = drone.get_state(env_frame=False)[..., :2].squeeze(1)
+    if drone_pos_xy is None:
+        drone_pos_xy = drone.get_state(env_frame=False)[..., :2]
+    # ensure shape [N,2]
+    if drone_pos_xy.ndim == 3 and drone_pos_xy.shape[1] == 1:
+        drone_pos_xy = drone_pos_xy.squeeze(1)
     x_in_center = (drone_pos_xy[:, 0] > -10) & (drone_pos_xy[:, 0] < 10)
     y_in_center = (drone_pos_xy[:, 1] > -10) & (drone_pos_xy[:, 1] < 10)
     valid_drone_mask = (x_in_center & y_in_center)

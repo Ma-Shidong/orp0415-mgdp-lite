@@ -237,6 +237,12 @@ class IsaacEnv(EnvBase):
         import pprint
         pprint.pprint(self.fake_tensordict().shapes)
 
+        # python-side counters (avoid torch .item() sync for logging / schedules)
+        self._global_step_count = 0
+        self._global_frame_count = 0
+        self._perf_step_counter = 0
+
+
 
     @classmethod
     def __init_subclass__(cls, **kwargs):
@@ -332,10 +338,27 @@ class IsaacEnv(EnvBase):
         tensordict.update(self._compute_reward_and_done())
         t_rew4 = time.perf_counter()
 
-        # 每 50 步打印一次（避免 print 反而拖慢）
-        if int(self.progress_buf[0].item()) % 50 == 0:
-            print(f"[PERF] sim={(t_sim1-t_pre0):.4f}s post={(t_post2-t_sim1):.4f}s "
-                f"obs={(t_obs3-t_post2):.4f}s rew={(t_rew4-t_obs3):.4f}s total={(t_rew4-t0):.4f}s")
+        # python-side counters (avoid torch sync)
+        self._global_step_count += 1
+        try:
+            self._global_frame_count += int(self.batch_size[0])
+        except Exception:
+            pass
+        self._perf_step_counter += 1
+
+        # optional perf prints (OFF by default; printing is expensive)
+        try:
+            task_cfg = getattr(self.cfg, "task", None)
+            debug_perf = bool(task_cfg.get("debug_print_perf", False)) if task_cfg is not None else False
+            every = int(task_cfg.get("debug_print_perf_every", 50)) if task_cfg is not None else 50
+        except Exception:
+            debug_perf, every = False, 50
+        if debug_perf and every > 0 and (self._perf_step_counter % every) == 0:
+            print(
+                f"[PERF] sim={(t_sim1-t_pre0):.4f}s post={(t_post2-t_sim1):.4f}s "
+                f"obs={(t_obs3-t_post2):.4f}s rew={(t_rew4-t_obs3):.4f}s total={(t_rew4-t0):.4f}s"
+            )
+
 
         return tensordict
 

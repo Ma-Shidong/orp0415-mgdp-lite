@@ -5,7 +5,7 @@ defaults:
   - /base/sim_base@_here_
 
 env:
-  num_envs: 128
+  num_envs: 512
   max_episode_length: 3000
 
 drone_model:
@@ -17,7 +17,7 @@ static_obs_num_per_gird: 1 #2
 dynamic_obs_num: 20 #40
 trace_prob: 0.5 
 
-lidar_range: 10.
+lidar_range: 10.0
 lidar_h_res: 36
 lidar_v_res: 6
 lidar_h_sample: 3
@@ -36,7 +36,14 @@ lidar_risk_decay_tau: 1.0
 lidar_risk_clear_time: 3.0
 lidar_risk_clear_margin: 1.0
 lidar_risk_enable: true
+
+# Optional: update lidar every N steps to reduce env-step cost
+lidar_update_period: 1
 bound_h: 1.
+
+# Override env constraints
+vel_max: 7.0
+virtual_ceiling: 5.0
 
 
 flow_gap: 25   
@@ -70,6 +77,12 @@ reach_goal_dis: 1.0
 # want a larger slow-down zone near the goal.
 touch_goal_dis: 1.0
 terminate_on_success: true
+
+# Training-time termination toggles (set false to penalize instead of terminate)
+terminate_on_vel_limit: true
+terminate_on_height_high: true
+vel_limit_penalty: 1.0
+height_high_penalty: 1.0
 success_bonus: 20.0
 time_penalty: 0.02
 
@@ -87,8 +100,16 @@ goal_reward_type: linear
 goal_w_d: 10.0
 goal_w_theta: 1.0
 
+# Plan A: amplify goal progress
+# progress = (last_dis - dis_now) * goal_progress_scale
+# if goal_progress_scale_by_dt: progress /= dt
+# then clamp to [-goal_progress_clamp, goal_progress_clamp]
+goal_progress_scale: 1.0
+goal_progress_scale_by_dt: true
+goal_progress_clamp: 2.0
+
 risk_gate_goal: true
-risk_gate_g_min: 0.3
+risk_gate_g_min: 0.6
 
 risk_relax_enable: true
 risk_relax_eta_j: 0.5
@@ -112,9 +133,21 @@ risk_cfg:
   alpha: 10.0
   rho0: 0.2
   w_r: 1.0
+  # optional risk curriculum (linear schedule over frames)
+  w_r_start: 0.3
+  w_r_end: 1.0
+  w_r_steps: 10000000
 
 collision_penalty: 10.0
 collision_include_height: true
 
 # Debug prints are expensive; keep them off in training
 debug_print_reward: false
+# base env perf print (in isaac_env.py)
+debug_print_perf: false
+debug_print_perf_every: 50
+
+static_obs_height_range:
+- 4.0
+- 6.0
+dobs_height: 5.0

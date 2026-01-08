@@ -85,6 +85,26 @@ def init_wandb(cfg):
         kwargs["id"] = wandb.util.generate_id()
         new_id = kwargs["id"]
         print(f"starting a new run: {new_id}")
+    # Disable W&B system metrics / metadata collection by default to reduce overhead.
+    # Can be overridden via cfg.wandb.disable_system_metrics=false
+    disable_sys = True
+    try:
+        disable_sys = bool(wandb_cfg.get("disable_system_metrics", True))
+    except Exception:
+        try:
+            disable_sys = bool(getattr(wandb_cfg, "disable_system_metrics", True))
+        except Exception:
+            disable_sys = True
+    if disable_sys:
+        try:
+            kwargs["settings"] = wandb.Settings(x_disable_stats=True, x_disable_meta=True)
+        except Exception:
+            # backward-compat for older wandb
+            try:
+                kwargs["settings"] = wandb.Settings(_disable_stats=True)
+            except Exception:
+                pass
+
     run = wandb.init(**kwargs)
     cfg_dict = dict_flatten(OmegaConf.to_container(cfg))
     run.config.update(cfg_dict, allow_val_change = kwargs["allow_val_change"])
