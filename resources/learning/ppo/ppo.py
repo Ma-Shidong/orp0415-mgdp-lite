@@ -44,9 +44,9 @@ from .common import GAE
 @dataclass
 class PPOConfig:
     name: str = "ppo"
-    train_every: int = 32
-    ppo_epochs: int = 8 #4
-    num_minibatches: int = 4 #16
+    train_every: int = 64
+    ppo_epochs: int = 10 #4
+    num_minibatches: int = 8 #16
 
     # whether to use privileged information
     priv_actor: bool = False

@@ -14,8 +14,15 @@ total_frames: 500_000_000
 max_iters: -1
 eval_interval: 1000
 save_interval: 1000
+
+# Evaluation rollout length (steps). Higher = more accurate but slower and higher memory.
+eval_max_steps: 1024
+# If you save videos, keep this smaller to avoid huge files.
+eval_video_max_steps: 256
+
 seed: 0
-resume_checkpoint: /home/csj/orp/models/orp5.1.pt  # set to a .pt path to continue training, keep null to start from scratch
+# resume_checkpoint: /home/csj/orp/models/orp5.13.pt
+resume_checkpoint: null  # set to a .pt path to continue training, keep null to start from scratch
 
 viewer:
   resolution: [960, 720]

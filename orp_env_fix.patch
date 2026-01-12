@@ -1,0 +1,6 @@
+diff --git a/resources/envs/single/env.py b/resources/envs/single/env.py
+--- a/resources/envs/single/env.py
++++ b/resources/envs/single/env.py
+@@ -1 +1 @@
+-self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width))
++self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", getattr(self, "static_obs_platform_width", 14.0)))

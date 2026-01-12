@@ -76,6 +76,9 @@ class Env(IsaacEnv):
         self.actions = None
         self.last_dis2goal = None
         self.last_acc = None
+        # Per-env validity mask for jerk baseline. We want to avoid penalizing jerk across episode
+        # boundaries for envs that have just been reset.
+        self.last_acc_valid = None
         self.dismap_image_queue = None
         self.dismap_flow_queue = None
         self.depth_image_queue = None
@@ -168,7 +171,56 @@ class Env(IsaacEnv):
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
         
         self.seed = 10
-        self.static_obs_num_per_gird = self.cfg.task.static_obs_num_per_gird
+
+        # ---------------------------------------------------------------------
+        # Static obstacles / terrain sizing
+        #
+        # IMPORTANT: HfDiscreteObstaclesTerrainCfg(num_obstacles=K) places K obstacles PER TILE.
+        # The original code used num_rows=num_cols=6 (36 tiles), so total obstacles ~= 36*K,
+        # easily creating an obstacle forest.
+        #
+        # Fix: generate ONE large tile (same total area) and interpret obstacles as TOTAL count:
+        #   static_obs_num_total (capped by static_obs_max_total)
+        #
+        # Keep legacy key for backward compatibility:
+        #   static_obs_num_per_grid (if static_obs_num_total is absent, treat it as TOTAL fallback)
+        # ---------------------------------------------------------------------
+        try:
+            self.static_obs_num_per_grid = int(getattr(self.cfg.task, "static_obs_num_per_grid"))
+        except Exception:
+            # legacy typo key
+            try:
+                self.static_obs_num_per_grid = int(getattr(self.cfg.task, "static_obs_num_per_gird"))
+            except Exception:
+                self.static_obs_num_per_grid = 0
+
+        self.static_obs_num_total = int(getattr(self.cfg.task, "static_obs_num_total", 0))
+        self.static_obs_max_total = int(getattr(self.cfg.task, "static_obs_max_total", 120))
+
+        _wr = getattr(self.cfg.task, "static_obs_width_range", [0.5, 0.9])
+        try:
+            self.static_obs_width_range = (float(_wr[0]), float(_wr[1]))
+        except Exception:
+            self.static_obs_width_range = (0.5, 0.9)
+
+        # terrain total size: tile_size * (num_rows/num_cols) (defaults keep legacy 36m x 36m)
+        self.terrain_tile_size = float(getattr(self.cfg.task, "terrain_tile_size", 6.0))
+        self.terrain_num_rows = int(getattr(self.cfg.task, "terrain_num_rows", 6))
+        self.terrain_num_cols = int(getattr(self.cfg.task, "terrain_num_cols", 6))
+        self.terrain_border_width = float(getattr(self.cfg.task, "terrain_border_width", 2.0))
+
+        self.terrain_num_rows = max(1, self.terrain_num_rows)
+        self.terrain_num_cols = max(1, self.terrain_num_cols)
+        self.terrain_total_size = (
+            float(self.terrain_tile_size * self.terrain_num_rows),
+            float(self.terrain_tile_size * self.terrain_num_cols),
+        )
+
+        # default reserved open area width (clamped later against total size)
+        # self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width))
+        self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", getattr(self, "static_obs_platform_width", 14.0))
+)
+
         # obstacle height configuration (from cfg.task)
         try:
             _hr = self.cfg.task.get("static_obs_height_range", [3.5, 4.0])
@@ -178,45 +230,120 @@ class Env(IsaacEnv):
             static_obs_height_range = (float(_hr[0]), float(_hr[1]))
         except Exception:
             static_obs_height_range = (3.5, 4.0)
+        self.static_obs_height_range = static_obs_height_range
 
         try:
             self.dobs_height = float(self.cfg.task.get("dobs_height", 4.0))
         except Exception:
             self.dobs_height = 4.0
 
-        terrain_cfg = TerrainImporterCfg(
-            num_envs=self.num_envs,
-            prim_path="/World/ground",
-            terrain_type="generator",
-            terrain_generator=TerrainGeneratorCfg(
-                seed=self.seed,
-                size=(6.0, 6.0),
-                border_width=20.0,
-                num_rows=6,
-                num_cols=6,
-                horizontal_scale=0.1,
-                vertical_scale=0.005,
-                slope_threshold=0.75,
-                use_cache=False,
-                sub_terrains={
-                    "obstacles": HfDiscreteObstaclesTerrainCfg(
-                        size=(6.0, 6.0),
-                        horizontal_scale=0.1,
-                        vertical_scale=0.1,
-                        border_width=0.0,
-                        num_obstacles=self.static_obs_num_per_gird,
-                        obstacle_height_mode="fixed",
-                        obstacle_width_range=(0.5, 0.9),
-                        obstacle_height_range=static_obs_height_range,
-                        platform_width=1.5,
-                    )
-                },
+        # ---------------------------------------------------------------------
+        # Terrain (static obstacles) - success curriculum (global)
+        # We cannot change heightfield obstacle count at runtime. Instead, we
+        # pre-generate one ground per curriculum level and switch by moving Z.
+        # ---------------------------------------------------------------------
+        sc_cfg = getattr(self.cfg.task, "success_curriculum", None)
+        self._curriculum_enabled = bool(getattr(sc_cfg, "enable", False)) if sc_cfg is not None else False
+        self._success_curriculum_levels = []
+        if self._curriculum_enabled:
+            self._success_curriculum_levels = list(getattr(sc_cfg, "levels", []))
+            if len(self._success_curriculum_levels) == 0:
+                self._curriculum_enabled = False
+
+        self._curriculum_level = int(getattr(sc_cfg, "start_level", 0)) if self._curriculum_enabled else 0
+        self._curriculum_level = max(
+            0,
+            min(
+                self._curriculum_level,
+                (len(self._success_curriculum_levels) - 1) if self._curriculum_enabled else 0,
             ),
-            max_init_terrain_level=5,
-            collision_group=-1,
-            debug_vis=False,
         )
-        terrain: TerrainImporter = terrain_cfg.class_type(terrain_cfg)
+
+        self._ground_prim_paths = []
+        self._terrains = []
+        num_levels = len(self._success_curriculum_levels) if self._curriculum_enabled else 1
+
+        for lvl in range(num_levels):
+            level_cfg = self._success_curriculum_levels[lvl] if self._curriculum_enabled else {}
+            # Decide TOTAL number of static obstacles for this level.
+            # Priority: per-level -> global -> legacy fallback
+            try:
+                num_obs_total = int(level_cfg.get("static_obs_num_total", self.static_obs_num_total)) if isinstance(level_cfg, dict) else int(self.static_obs_num_total)
+            except Exception:
+                num_obs_total = int(self.static_obs_num_total)
+
+            if num_obs_total <= 0:
+                # legacy fallback: treat per_grid as TOTAL if provided (to avoid breaking older configs)
+                num_obs_total = int(self.static_obs_num_per_grid)
+
+            # Safety cap (TOTAL)
+            try:
+                max_total = int(level_cfg.get("static_obs_max_total", self.static_obs_max_total)) if isinstance(level_cfg, dict) else int(self.static_obs_max_total)
+            except Exception:
+                max_total = int(self.static_obs_max_total)
+            max_total = max(0, int(max_total))
+            num_obs = max(0, min(int(num_obs_total), int(max_total)))
+
+            # Optional: allow per-level platform width to reserve a free corridor
+# Optional: allow per-level platform width to reserve a free corridor
+            try:
+                platform_width = float(level_cfg.get("static_obs_platform_width",
+                                      getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width)))
+            except Exception:
+                platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width))
+            platform_width = max(0.0, platform_width)
+            # Clamp against available inner width to avoid invalid terrain generation.
+            # inner_size = min(total_size) - 2*border_width
+            bw = float(getattr(self.cfg.task, "terrain_border_width", self.terrain_border_width))
+            bw = max(0.0, bw)
+            inner = max(0.0, min(self.terrain_total_size[0], self.terrain_total_size[1]) - 2.0 * bw)
+            if inner > 0.0:
+                platform_width = min(platform_width, max(0.0, inner - 0.1))
+
+            prim_path = "/World/ground" if lvl == 0 else f"/World/ground_l{lvl}"
+            terrain_cfg = TerrainImporterCfg(
+                prim_path=prim_path,
+                terrain_type="generator",
+                terrain_generator=TerrainGeneratorCfg(
+                    seed=self.seed + lvl,
+                    size=(self.terrain_total_size[0], self.terrain_total_size[1]),
+                    border_width=min(max(self.terrain_border_width, 0.0), 0.5*min(self.terrain_total_size[0], self.terrain_total_size[1]) - 0.1),
+                    num_rows=1,
+                    num_cols=1,
+                    horizontal_scale=0.1,
+                    vertical_scale=0.005,
+                    slope_threshold=0.75,
+                    use_cache=False,
+                    curriculum=False,
+                    sub_terrains={
+                        "obstacles": HfDiscreteObstaclesTerrainCfg(
+                            size=(self.terrain_total_size[0], self.terrain_total_size[1]),
+                            horizontal_scale=0.1,
+                            vertical_scale=0.1,
+                            border_width=0.0,
+                            num_obstacles=num_obs,
+                            obstacle_height_mode="fixed",
+                            obstacle_width_range=self.static_obs_width_range,
+                            obstacle_height_range=(self.static_obs_height_range[0], self.static_obs_height_range[1]),
+                            platform_width=platform_width,
+                        ),
+                    },
+                ),
+                num_envs=self.num_envs,
+                max_init_terrain_level=5,
+                collision_group=-1,
+                debug_vis=False,
+            )
+            terrain: TerrainImporter = terrain_cfg.class_type(terrain_cfg)
+            self._terrains.append(terrain)
+            self._ground_prim_paths.append(prim_path)
+
+        # curriculum switch handshake
+        self._pending_curriculum_level = None
+        self._force_curriculum_reset = False
+
+        # Activate selected ground at z=0; park the rest far below.
+        self._apply_ground_level(self._curriculum_level)
 
         # dynamic obstacles (support disabling with dynamic_obs_num=0)
         self.dynamic_obs_num = int(self.cfg.task.dynamic_obs_num)
@@ -261,6 +388,17 @@ class Env(IsaacEnv):
                 dobs_cfg_dict[f"Cylinder_{i}"] = cylinder_cfg
             cylinder_collection_cfg = RigidObjectCollectionCfg(rigid_objects=dobs_cfg_dict)
             self.dobs = RigidObjectCollection(cfg=cylinder_collection_cfg)
+        # Dynamic obstacles curriculum: pre-generate `dynamic_obs_num` and only
+        # activate a prefix of them (global curriculum).
+        self._dobs_active_num = int(self.dynamic_obs_num)
+        if getattr(self, "_curriculum_enabled", False) and len(getattr(self, "_success_curriculum_levels", [])) > 0:
+            try:
+                level_cfg = self._success_curriculum_levels[int(getattr(self, "_curriculum_level", 0))]
+                self._dobs_active_num = int(level_cfg.get("dynamic_obs_active", self.dynamic_obs_num))
+            except Exception:
+                self._dobs_active_num = int(self.dynamic_obs_num)
+        self._dobs_active_num = max(0, min(int(self._dobs_active_num), int(self.dynamic_obs_num)))
+
         self.wall_num = 1
         self.wall_width = 20
         self.wall_height = 0.4
@@ -313,6 +451,14 @@ class Env(IsaacEnv):
         self.lidar_risk_clear_margin = float(self.cfg.task.get("lidar_risk_clear_margin", 1.0))
         self.lidar_risk_enable = bool(self.cfg.task.get("lidar_risk_enable", True))
 
+        # NOTE(compat): IsaacLab RayCaster currently supports **exactly one** mesh prim.
+        # In this repo we may generate multiple terrain variants (one per curriculum level).
+        # We therefore bind the lidar to the *active* ground mesh only, and when the
+        # curriculum switches level we re-create the RayCaster with the new mesh prim.
+        active_ground_prim = getattr(self, "_active_ground_prim_path", None)
+        if active_ground_prim is None:
+            active_ground_prim = getattr(self, "_ground_prim_paths", ["/World/ground"])[0]
+
         ray_caster_cfg = RayCasterCfg(
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
             offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
@@ -322,10 +468,12 @@ class Env(IsaacEnv):
                 vertical_ray_angles = torch.linspace(*self.lidar_vfov, self.lidar_v_res * self.lidar_v_sample)
             ),
             debug_vis=False,
-            mesh_prim_paths=["/World/ground"]
+            mesh_prim_paths=[active_ground_prim]
         )
+        # Keep a copy for curriculum-time re-init.
+        self._lidar_cfg = ray_caster_cfg
         self.lidar: RayCaster = ray_caster_cfg.class_type(ray_caster_cfg)
-        return ["/World/ground"]
+        return getattr(self, "_ground_prim_paths", ["/World/ground"])
 
     def _set_specs(self):
         drone_state_dim = self.drone.state_spec.shape[-1]
@@ -373,6 +521,12 @@ class Env(IsaacEnv):
             "goal_gate": UnboundedContinuousTensorSpec(1),
             "plan_success": UnboundedContinuousTensorSpec(1),
             "flight_success": UnboundedContinuousTensorSpec(1),
+
+            # Global success curriculum bookkeeping
+            "curriculum_level": UnboundedContinuousTensorSpec(1),
+            "curriculum_static_obs_num_per_grid": UnboundedContinuousTensorSpec(1),
+            "curriculum_dobs_active": UnboundedContinuousTensorSpec(1),
+            "curriculum_reset": UnboundedContinuousTensorSpec(1),
             "avg_speed": UnboundedContinuousTensorSpec(1),
             "max_speed": UnboundedContinuousTensorSpec(1),
             "avg_acc": UnboundedContinuousTensorSpec(1),
@@ -408,7 +562,119 @@ class Env(IsaacEnv):
         self.observation_spec["stats"] = stats_spec 
         self.stats = stats_spec.zero()
 
+    # ---------------------------------------------------------------------
+    # Global success curriculum API
+    # ---------------------------------------------------------------------
+    def request_curriculum_level(self, new_level: int):
+        """Request a global curriculum level switch.
+
+        The env will force all env instances to `done` on the next step, and will
+        only apply the terrain/dobs switch during the subsequent *global* reset.
+        """
+        if not getattr(self, "_curriculum_enabled", False):
+            return
+        max_lvl = max(0, len(getattr(self, "_success_curriculum_levels", [])) - 1)
+        new_level = int(max(0, min(int(new_level), max_lvl)))
+        if new_level == int(getattr(self, "_curriculum_level", 0)):
+            return
+        self._pending_curriculum_level = new_level
+        self._force_curriculum_reset = True
+
+    def _apply_curriculum_level(self, level: int):
+        """Apply curriculum switch (called during global reset)."""
+        if not getattr(self, "_curriculum_enabled", False):
+            return
+        level = int(level)
+        self._curriculum_level = level
+
+        # Switch terrain by moving active ground to z=0.
+        prev_ground = getattr(self, "_active_ground_prim_path", None)
+        self._apply_ground_level(level)
+        new_ground = getattr(self, "_active_ground_prim_path", None)
+
+        # Re-bind lidar to the new ground mesh.
+        # (RayCaster supports only one mesh prim, so we must rebuild on switch.)
+        if new_ground is not None and prev_ground != new_ground and hasattr(self, "_lidar_cfg"):
+            try:
+                self._lidar_cfg.mesh_prim_paths = [new_ground]
+                # Drop old sensor so its weakref callbacks can GC safely.
+                self.lidar = None
+                self.lidar = self._lidar_cfg.class_type(self._lidar_cfg)
+                # Force immediate init (same pattern as __init__).
+                if hasattr(self.lidar, "_initialize_impl"):
+                    self.lidar._initialize_impl()
+            except Exception as e:
+                print(f"[WARN] Failed to re-create lidar on curriculum switch: {e}")
+
+        # Update active dynamic obstacles count.
+        try:
+            cfg = self._success_curriculum_levels[level]
+            self._dobs_active_num = int(cfg.get("dynamic_obs_active", self.dynamic_obs_num))
+        except Exception:
+            self._dobs_active_num = int(getattr(self, "dynamic_obs_num", 0))
+        self._dobs_active_num = max(0, min(int(self._dobs_active_num), int(getattr(self, "dynamic_obs_num", 0))))
+
+        # Immediately park inactive obstacles so the curriculum switch is visually correct.
+        if getattr(self, "dobs", None) is not None and getattr(self, "set_dobs_state", None) is not None:
+            active = int(self._dobs_active_num)
+            total = int(getattr(self, "dynamic_obs_num", 0))
+            if active < total:
+                self.set_dobs_state[active:, :2] = 1.0e6
+                self.set_dobs_state[active:, 2] = self.dobs_height / 2
+                try:
+                    self.dobs.write_object_link_pose_to_sim(self.set_dobs_state[..., :7])
+                except Exception:
+                    pass
+        self._dobs_active_num = max(0, min(int(self._dobs_active_num), int(getattr(self, "dynamic_obs_num", 0))))
+
+        # Mirror static obs count for logging (terrain itself is already generated).
+        try:
+            cfg = self._success_curriculum_levels[level]
+            self.static_obs_num_per_grid = int(cfg.get("static_obs_num_per_grid", self.static_obs_num_per_grid))
+        except Exception:
+            pass
+
+    def _apply_ground_level(self, active_level: int):
+        """Move the active terrain to z=0 and park the rest far below."""
+        paths = getattr(self, "_ground_prim_paths", None)
+        if not paths:
+            return
+
+        active_level = int(active_level)
+        self._active_ground_idx = active_level
+        self._active_ground_prim_path = paths[active_level]
+
+        # Always use UsdGeom Xform ops (do not rely on set_prim_property), otherwise
+        # Hydra/scene delegate may warn that xformOp:translate does not exist.
+        try:
+            from omni.isaac.core.utils.prims import get_prim_at_path
+            from pxr import UsdGeom, Gf
+
+            for i, p in enumerate(paths):
+                z = 0.0 if i == active_level else -1000.0 * (i + 1)
+                prim = get_prim_at_path(p)
+                xf = UsdGeom.Xformable(prim)
+                # Reuse translate op if present; otherwise add one.
+                tr_op = None
+                for op in xf.GetOrderedXformOps():
+                    if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                        tr_op = op
+                        break
+                if tr_op is None:
+                    tr_op = xf.AddTranslateOp()
+                tr_op.Set(Gf.Vec3d(0.0, 0.0, float(z)))
+        except Exception:
+            # Best-effort; if translate ops fail, we will just keep terrains as-is.
+            pass
+
     def _reset_idx(self, env_ids: torch.Tensor):
+        # Apply pending curriculum only when we are resetting *all* envs.
+        if getattr(self, "_pending_curriculum_level", None) is not None:
+            if int(env_ids.numel()) == int(self.num_envs):
+                self._apply_curriculum_level(int(self._pending_curriculum_level))
+                self._pending_curriculum_level = None
+                self._force_curriculum_reset = False
+
         self.drone._reset_idx(env_ids, self.training)
 
         if self.speed_sum is None:
@@ -487,10 +753,15 @@ class Env(IsaacEnv):
             if init_dis.ndim == 1:
                 init_dis = init_dis.view(-1, 1)
             self.last_dis2goal[env_ids] = init_dis
-        self.last_acc = None
-        self.last_act = None
-        self.last_vel = None
-        self._global_frame_count = 0  # global env-frame counter for curricula (counts vectorized transitions)
+
+
+        # Mark jerk baseline invalid for just-reset envs. This avoids penalizing jerk across
+        # episode boundaries in vectorized training.
+        if self.last_acc_valid is None:
+            self.last_acc_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        else:
+            self.last_acc_valid = self.last_acc_valid.view(-1)
+        self.last_acc_valid[env_ids] = False
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         # defensive: ensure acc_min exists (older configs / patches)
@@ -504,18 +775,51 @@ class Env(IsaacEnv):
         if (getattr(self, "dynamic_obs_num", 0) > 0) and (self.dobs is not None):
             if self.set_dobs_state is None:
                 self.set_dobs_state = self.dobs.data.default_object_state.clone()
+                # Start by placing all obstacles at their generated origins...
                 self.set_dobs_state[..., :2] = self.dobs_origins
-                self.set_dobs_state[..., 2] = self.dobs_height/2
+                self.set_dobs_state[..., 2] = self.dobs_height / 2
+
+                # ...then immediately park INACTIVE obstacles far away so the rendered scene
+                # matches the curriculum setting from the very first frame.
+                active = int(getattr(self, "_dobs_active_num", self.dynamic_obs_num))
+                active = max(0, min(active, int(self.dynamic_obs_num)))
+                if active < int(self.dynamic_obs_num):
+                    self.set_dobs_state[active:, :2] = 1.0e6
+                    self.set_dobs_state[active:, 2] = self.dobs_height / 2
+                    self.dobs_states[active:, 0, 0] = 1.0e6
+                    self.dobs_states[active:, 0, 1] = 1.0e6
+                    self.dobs_states[active:, 1].zero_()
             else:
                 if self.trace_prob is None:
                     self.trace_prob = self.cfg.task.trace_prob
-                self.dobs_states[:, 1] = env_utils.update_dobs_vel(self.device, self.dobs_states, 
-                                                                   self.dobs_pos_x_range, self.dobs_pos_y_range, 
-                                                                   self.drone, self.trace_prob, drone_pos_xy=drone_pos_xy)
-                set_dobs_vel = self.dobs_states[:, 1]
-                self.set_dobs_state[..., :2] = self.dobs_states[:, 0] + (set_dobs_vel * self.dt)
-                self.set_dobs_state[..., 2] = self.dobs_height/2
-                self.dobs_states[:, 0] = self.set_dobs_state[..., :2]
+
+                active = int(getattr(self, "_dobs_active_num", self.dynamic_obs_num))
+                active = max(0, min(active, int(self.dynamic_obs_num)))
+                self._dobs_active_num = active
+
+                if active > 0:
+                    self.dobs_states[:active, 1] = env_utils.update_dobs_vel(
+                        self.device,
+                        self.dobs_states[:active],
+                        self.dobs_pos_x_range,
+                        self.dobs_pos_y_range,
+                        self.drone,
+                        self.trace_prob,
+                        drone_pos_xy=drone_pos_xy,
+                    )
+                    set_dobs_vel = self.dobs_states[:active, 1]
+                    self.set_dobs_state[:active, :2] = self.dobs_states[:active, 0] + (set_dobs_vel * self.dt)
+                    self.set_dobs_state[:active, 2] = self.dobs_height / 2
+                    self.dobs_states[:active, 0] = self.set_dobs_state[:active, :2]
+
+                # Park inactive obstacles far away
+                if active < int(self.dynamic_obs_num):
+                    self.dobs_states[active:, 1].zero_()
+                    self.dobs_states[active:, 0, 0] = 1.0e6
+                    self.dobs_states[active:, 0, 1] = 1.0e6
+                    self.set_dobs_state[active:, :2] = 1.0e6
+                    self.set_dobs_state[active:, 2] = self.dobs_height / 2
+
             self.dobs.write_object_link_pose_to_sim(self.set_dobs_state[..., :7])
 
         if self.set_wall_state is None:
@@ -535,8 +839,8 @@ class Env(IsaacEnv):
 
 
     def _post_sim_step(self, tensordict: TensorDictBase):
-        # curriculum driver: count global frames (vectorized transitions)
-        self._global_frame_count = int(getattr(self, "_global_frame_count", 0) + int(self.num_envs))
+        # NOTE: IsaacEnv already increments `self._global_frame_count` by `num_envs` each step.
+        # Do not increment it here to avoid double-counting.
         # optional lidar update down-sampling (cfg: task.lidar_update_period, default=1)
         try:
             period = int(self.cfg.task.get("lidar_update_period", 1))
@@ -591,11 +895,13 @@ class Env(IsaacEnv):
         input_dir_w[..., 1] = sy[:, None] * input_dir[..., 0] + cy[:, None] * input_dir[..., 1]
         input_dir_w[..., 2] = input_dir[..., 2]
 
-        if (getattr(self, "dynamic_obs_num", 0) > 0) and (self.dobs_states is not None) and (self.dobs_states.shape[0] > 0):
+        active = int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))
+        active = max(0, min(active, int(getattr(self, "dynamic_obs_num", 0))))
+        if active > 0 and (self.dobs_states is not None) and (self.dobs_states.shape[0] >= active):
             self.dobs_hits_w = env_utils.dobs_lidar_hits(
                 self.lidar_range,
                 self.dobs_height,
-                self.dobs_states,
+                self.dobs_states[:active],
                 self.lidar.data.pos_w,
                 ray_dir_w,
                 error_tolerance=0.33
@@ -980,8 +1286,15 @@ class Env(IsaacEnv):
         acc = self.actions
         acc_magnitude = acc.norm(dim=-1, keepdim=True)
 
+        # --- jerk baseline handling ---
+        # `last_acc` is used to compute a jerk reward/penalty. In vectorized training, only a
+        # subset of envs may reset on any given step. Resetting last_acc globally would affect
+        # every env and create large training artifacts.
         if self.last_acc is None:
-            self.last_acc = acc
+            self.last_acc = acc.clone()
+            self.last_acc_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        elif self.last_acc_valid is None:
+            self.last_acc_valid = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
         if self.last_dis2goal is None:
             self.last_dis2goal = dis2goal
 
@@ -1025,6 +1338,13 @@ class Env(IsaacEnv):
         reward_vel = reward_vel.view(-1, 1)
         reward_acc = reward_acc.view(-1, 1)
         reward_jerk = reward_jerk.view(-1, 1)
+        # Avoid applying jerk penalty across episode boundaries.
+        # Envs that were reset since the previous step have `last_acc_valid=False`.
+        if self.last_acc_valid is not None:
+            invalid = (~self.last_acc_valid).view(-1, 1)
+            if invalid.any():
+                reward_jerk = reward_jerk.clone()
+                reward_jerk[invalid] = 1.0
         reward_height = reward_height.view(-1, 1)
 
         # goal reward (ungated)
@@ -1036,8 +1356,10 @@ class Env(IsaacEnv):
 
         # legacy safety rewards (optional to keep for ablation)
         reward_safety = self._compute_safety_reward(self.lidar_scan)
+        active = int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))
+        active = max(0, min(active, int(getattr(self, "dynamic_obs_num", 0))))
         reward_dobs = self._compute_dobs_reward(
-            self.dobs_states,
+            self.dobs_states[:active] if (active > 0 and self.dobs_states is not None) else None,
             self.drone_state[..., :2].squeeze(1),
             self.drone.vel_w[..., :2].squeeze(1),
         )
@@ -1336,12 +1658,33 @@ class Env(IsaacEnv):
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
 
         self.last_acc = acc
+        if self.last_acc_valid is not None:
+            self.last_acc_valid[:] = True
         self.last_dis2goal = dis2goal
 
         plan_success = success_mask
         flight_success = success_mask & (~terminated_base) & (~truncated)
         self.stats["plan_success"] = plan_success.float()
         self.stats["flight_success"] = flight_success.float()
+        # Curriculum bookkeeping (global)
+        lvl = int(getattr(self, "_curriculum_level", 0))
+        self.stats["curriculum_level"] = torch.full((self.num_envs, 1), float(lvl), device=self.device)
+        self.stats["curriculum_static_obs_num_per_grid"] = torch.full(
+            (self.num_envs, 1), float(getattr(self, "static_obs_num_per_grid", 0)), device=self.device
+        )
+        self.stats["curriculum_dobs_active"] = torch.full(
+            (self.num_envs, 1), float(int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))), device=self.device
+        )
+
+        # Safe global switch: force all envs to done on the next step; apply the
+        # actual terrain/dobs switch in the subsequent global reset.
+        if getattr(self, "_force_curriculum_reset", False):
+            terminated = torch.ones_like(terminated, dtype=torch.bool)
+            truncated = torch.zeros_like(truncated, dtype=torch.bool)
+            self.stats["curriculum_reset"] = torch.ones((self.num_envs, 1), device=self.device)
+        else:
+            self.stats["curriculum_reset"] = torch.zeros((self.num_envs, 1), device=self.device)
+
 
         assert terminated.shape == (self.num_envs, 1), terminated.shape
         assert truncated.shape == (self.num_envs, 1), truncated.shape
@@ -1579,6 +1922,12 @@ class Env(IsaacEnv):
             reward_safety = reward_safety.clamp_max(float(safety_r_max))
         return reward_safety.reshape(-1, 1)
     def _compute_dobs_reward(self, obstacle_tensor, drone_pos, drone_vel):
+        # NOTE: obstacle_tensor may be None/empty when dynamic obstacles are disabled
+        # (e.g., curriculum sets dynamic_obs_active=0). In that case, return 0 reward.
+        if obstacle_tensor is None or (hasattr(obstacle_tensor, "numel") and obstacle_tensor.numel() == 0):
+            num_env = drone_pos.shape[0]
+            return torch.zeros((num_env, 1), device=self.device)
+
         num_env = drone_pos.shape[0]
         n = obstacle_tensor.shape[0]
         if n == 0:
