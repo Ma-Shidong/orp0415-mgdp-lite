@@ -218,7 +218,7 @@ class Env(IsaacEnv):
 
         # default reserved open area width (clamped later against total size)
         # self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width))
-        self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", getattr(self, "static_obs_platform_width", 14.0))
+        self.static_obs_platform_width = float(self.cfg.task.get("static_obs_platform_width", 14.0))
 )
 
         # obstacle height configuration (from cfg.task)
