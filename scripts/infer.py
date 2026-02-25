@@ -224,8 +224,8 @@ class Infer:
         self.prev_rot = None
         self.prev_time = None
         self.lidar_dirs = None
-        self.risk_depth = None
-        self.risk_age = None
+        self.risk_virtual_depth = None
+        self.risk_virtual_age = None
 
         # last commanded acceleration in world frame (m/s^2), used for the state "acc_input"
         self.last_target_acc = torch.zeros(1, 3)
@@ -265,7 +265,6 @@ class Infer:
         self.lidar_risk_clear_time = float(self.cfg.task.get("lidar_risk_clear_time", 3.0))
         self.lidar_risk_clear_margin = float(self.cfg.task.get("lidar_risk_clear_margin", 1.0))
         self.lidar_risk_enable = bool(self.cfg.task.get("lidar_risk_enable", True))
-        self.lidar_effective_range = float(self.cfg.task.get("lidar_effective_range", 5.0))
         self.lidar_v_edge_margin_deg = self.cfg.task.get("lidar_v_edge_margin_deg", None)
         # --- height / kinematics bounds (match training env.py) ---
         # Training has a virtual floor/ceiling; without this, the policy can keep drifting down in ROS.
@@ -588,17 +587,16 @@ class Infer:
             torch.full_like(lidar_scan_dis, self.lidar_range),
         )
 
-        # --- Optional "depth missing keep + decay" risk layer (match env.py)
-        if self.lidar_risk_enable and self.risk_depth is None:
-            self.risk_depth = torch.full_like(lidar_scan_dis, self.lidar_range + self.lidar_risk_clear_margin)
-            self.risk_age = torch.zeros_like(lidar_scan_dis)
+        # --- Optional virtual risk memory for vertical FOV edges (risk-only)
+        if self.lidar_risk_enable and self.risk_virtual_depth is None:
+            self.risk_virtual_depth = torch.full_like(lidar_scan_dis, self.lidar_range + self.lidar_risk_clear_margin)
+            self.risk_virtual_age = torch.zeros_like(lidar_scan_dis)
 
         if self.lidar_risk_enable:
             decay_target = self.lidar_range + self.lidar_risk_clear_margin
-
+            decay_tau = float(self.cfg.task.get("lidar_risk_virtual_decay_tau", self.lidar_risk_decay_tau))
+            clear_time = float(self.cfg.task.get("lidar_risk_virtual_clear_time", self.lidar_risk_clear_time))
             dt = float(self.lidar_radial_dt)  # keep consistent with training env dt
-
-            eff_range = min(float(self.lidar_effective_range), float(self.lidar_range))
 
             # vertical edge band margin (deg). If not set, use ~1 vertical bin.
             v_margin = self.lidar_v_edge_margin_deg
@@ -619,33 +617,45 @@ class Infer:
 
             hit_mask = lidar_scan_dis < self.lidar_range
             nohit_mask = ~hit_mask
+            edge_hit = hit_mask & edge_mask
+            edge_nohit = nohit_mask & edge_mask
 
-            # update memory on hits
-            self.risk_depth = torch.where(hit_mask, lidar_scan_dis, self.risk_depth)
-            self.risk_age = torch.where(hit_mask, torch.zeros_like(self.risk_age), self.risk_age)
+            # update virtual memory on edge hits
+            self.risk_virtual_depth = torch.where(edge_hit, lidar_scan_dis, self.risk_virtual_depth)
+            self.risk_virtual_age = torch.where(edge_hit, torch.zeros_like(self.risk_virtual_age), self.risk_virtual_age)
 
-            has_risk = self.risk_depth < self.lidar_range
-            keep_due_edge = edge_mask
-            keep_due_far = self.risk_depth > eff_range
-            keep_mask = nohit_mask & has_risk & (keep_due_edge | keep_due_far)
-            clear_now_mask = nohit_mask & (~keep_mask)
-
-            self.risk_age = torch.where(keep_mask, self.risk_age + dt, self.risk_age)
-            self.risk_age = torch.where(clear_now_mask, torch.zeros_like(self.risk_age), self.risk_age)
-
-            decay_factor = torch.exp(- (self.risk_age / max(self.lidar_risk_decay_tau, 1e-6)) ** 2)
-            risk_depth_decay = decay_target - (decay_target - self.risk_depth) * decay_factor
-            clear_decay_mask = (self.risk_age >= self.lidar_risk_clear_time) | (risk_depth_decay >= decay_target)
-
-            self.risk_depth = torch.where(
-                keep_mask,
-                torch.where(clear_decay_mask, torch.full_like(self.risk_depth, decay_target), risk_depth_decay),
-                self.risk_depth,
+            # keep only for edge bands; clear outside edges
+            self.risk_virtual_depth = torch.where(
+                edge_mask,
+                self.risk_virtual_depth,
+                torch.full_like(self.risk_virtual_depth, decay_target),
             )
-            self.risk_depth = torch.where(clear_now_mask, torch.full_like(self.risk_depth, decay_target), self.risk_depth)
+            self.risk_virtual_age = torch.where(edge_mask, self.risk_virtual_age, torch.zeros_like(self.risk_virtual_age))
 
-            # fuse back
-            lidar_scan_dis = torch.minimum(lidar_scan_dis, self.risk_depth)
+            has_risk = self.risk_virtual_depth < self.lidar_range
+            keep_mask = edge_nohit & has_risk
+            clear_now_mask = edge_nohit & (~keep_mask)
+
+            self.risk_virtual_age = torch.where(keep_mask, self.risk_virtual_age + dt, self.risk_virtual_age)
+            self.risk_virtual_age = torch.where(clear_now_mask, torch.zeros_like(self.risk_virtual_age), self.risk_virtual_age)
+
+            decay_factor = torch.exp(- (self.risk_virtual_age / max(decay_tau, 1e-6)) ** 2)
+            risk_depth_decay = decay_target - (decay_target - self.risk_virtual_depth) * decay_factor
+            clear_decay_mask = (self.risk_virtual_age >= clear_time) | (risk_depth_decay >= decay_target)
+
+            self.risk_virtual_depth = torch.where(
+                keep_mask,
+                torch.where(clear_decay_mask, torch.full_like(self.risk_virtual_depth, decay_target), risk_depth_decay),
+                self.risk_virtual_depth,
+            )
+            self.risk_virtual_depth = torch.where(
+                clear_now_mask,
+                torch.full_like(self.risk_virtual_depth, decay_target),
+                self.risk_virtual_depth,
+            )
+
+            # risk-only fused distance (not used for policy observation)
+            self.lidar_scan_dis_risk = torch.minimum(lidar_scan_dis, self.risk_virtual_depth)
 
         if self.depth_image_queue is None:
             window = max(1, self.lidar_radial_window)
@@ -925,4 +935,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-

@@ -1,78 +1,87 @@
 name: Env
-
 defaults:
-  - /base/env_base@_here_
-  - /base/sim_base@_here_
-
+- /base/env_base@_here_
+- /base/sim_base@_here_
 env:
-  num_envs: 512
+  num_envs: 1024
   max_episode_length: 3000
-
 drone_model:
   name: Hummingbird
   controller: LeeAccelerationController
-
 time_encoding: true
 # Terrain / static obstacles (TOTAL count, not per-tile)
 terrain_tile_size: 6.0
 terrain_num_rows: 6
 terrain_num_cols: 6
 terrain_border_width: 2.0
-
 # TOTAL number of static obstacles over the whole terrain
 static_obs_num_total: 0
 static_obs_max_total: 90
-static_obs_width_range: [0.30, 0.60]
+static_obs_width_range: [0.4, 0.6]
 static_obs_platform_width: 14.0
-
-
+static_obs_min_sep: 1.0
 success_curriculum:
   enable: true
   start_level: 0
-
-  # Use plan_success early (flight_success can stay ~0 for long periods)
-  metric: plan_success     # plan_success | flight_success
-
-  # EMA smoothing
-  ema_alpha: 0.05
-
+  metric: done_success # plan_success | flight_success
+  check_every_iters: 25
+  ema_alpha: 0.05 # EMA smoothing
   # Switch control (evaluations)
-  patience: 3
-  cooldown: 2
-
+  patience: 2
+  cooldown: 3
   levels:
   - name: L0_empty
-    success_ge: 0.00
-    static_obs_num_total: 0
-    static_obs_platform_width: 14.0
-    dynamic_obs_active: 0
-
-  - name: L1_sparse_static
-    success_ge: 0.08
-    static_obs_num_total: 18
-    static_obs_platform_width: 12.0
-    dynamic_obs_active: 0
-
-  - name: L2_medium
-    success_ge: 0.16
-    static_obs_num_total: 30
+    success_ge: 0.0
+    static_obs_num_total: 20
     static_obs_platform_width: 10.0
-    dynamic_obs_active: 6
-
-  - name: L3_hard
-    success_ge: 0.24
-    static_obs_num_total: 45
+    dynamic_obs_active: 0
+    wall_enable: false
+  - name: L1_sparse_static
+    success_ge: 0.4
+    static_obs_num_total: 40
     static_obs_platform_width: 8.0
-    dynamic_obs_active: 12
-
-  - name: L4_dense
-    success_ge: 0.32
-    static_obs_num_total: 60
+    dynamic_obs_active: 0
+    wall_enable: false
+  - name: L2_medium_static
+    success_ge: 0.5
+    static_obs_num_total: 40
+    static_obs_platform_width: 6.0
+    dynamic_obs_active: 5
+    wall_enable: false
+  - name: L3_dynamic_small
+    success_ge: 0.55
+    static_obs_num_total: 40
+    static_obs_platform_width: 6.0
+    dynamic_obs_active: 10
+    wall_enable: false
+  - name: L4_medium_dynamic
+    success_ge: 0.60
+    static_obs_num_total: 40
     static_obs_platform_width: 6.0
     dynamic_obs_active: 20
-
-dynamic_obs_num: 30  # max moving obstacles that may appear (inactive ones will be parked)
-trace_prob: 0.5 
+    wall_enable: false
+  - name: L5_hard
+    success_ge: 0.65
+    static_obs_num_total: 50
+    static_obs_platform_width: 4.0
+    dynamic_obs_active: 30
+    wall_enable: false
+  - name: L6_dense
+    success_ge: 0.7
+    static_obs_num_total: 60
+    static_obs_platform_width: 2.0
+    dynamic_obs_active: 30
+    wall_enable: true
+dynamic_obs_num: 30 # max moving obstacles that may appear
+trace_prob: 0.5
+dobs_min_sep: 1.0
+dobs_vel_range: [0.5, 3.0]
+dobs_rad_range: [0.3, 0.4]
+# Wide wall (curriculum can override wall_enable)
+wall_enable: true
+wall_width: 20.0
+wall_height: 0.4
+fly_height: 2.0
 
 lidar_range: 10.0
 lidar_h_res: 36
@@ -89,118 +98,108 @@ lidar_radial_min_speed: 0.01
 lidar_radial_max_speed: 10.0
 lidar_radial_invalid_value: 0.0
 lidar_radial_dt: 0.02
-lidar_risk_decay_tau: 1.0
-lidar_risk_clear_time: 3.0
+lidar_risk_decay_tau: 1.0 
+lidar_risk_clear_time: 1.0
+lidar_risk_virtual_decay_tau: 1.0 # 值越小，虚拟扇区里保存的“视野外障碍”衰减越快
+lidar_risk_virtual_clear_time: 1.0
 lidar_risk_clear_margin: 1.0
 lidar_risk_enable: true
-
 # Optional: update lidar every N steps to reduce env-step cost
 lidar_update_period: 1
-bound_h: 1.
-
+bound_h: 1.0
 # Override env constraints
 vel_max: 7.0
-virtual_ceiling: 5.0
-
-
-flow_gap: 25   
-flow_slide_window: 5   
+virtual_ground: 0.2
+virtual_ceiling: 4.5
+bound_line_max_dist: 10.0
+flow_gap: 25
+flow_slide_window: 5
 
 vis_lidar: false
 vis_dismap: false
 
 action_transform: null
-
-reward_effort_weight: 0.1
-reward_cfg:
-  k_s: 0.0
-lidar_effective_range: 10.0 #/m
-lidar_v_edge_margin_deg: 6.0 #/degree
+lidar_v_edge_margin_deg: 6.0
 
 # -----------------------------
 # Goal-oriented reward settings
 # -----------------------------
 reward_weights:
-  k_v: 1.2
-  k_a: 0.6
-  k_j: 0.2
-  k_h: 0.3
-  k_g: 0.8
-  k_s: 1.0
-  k_d: 0.6
+  w_v: 0.3     # cruise-speed shaping weight
+  w_a: 0.10      # acceleration energy penalty weight
+  w_j: 0.02     # jerk penalty weight (risk-relaxed)
+  w_h: 0.35     # height hold penalty weight (risk-relaxed)
+  w_g: 2.7      # goal shaping weight (risk-gated)
+# Cruise speed shaping parameters
+v_ref: 2.5
+sigma_v: 2.5
+# 高度惩罚的形式是R_h = -w_h * g(risk) * P_band - w_floor * P_floor - w_ceil * P_ceil
+height_ref: 2.0
+height_deadband: 0.45        # 偏离超过 deadband 后，惩罚用 Huber 形式，sigma_z 越大，惩罚增长越慢（更松）。
+height_band_sigma: 0.15
+height_barrier_margin: 0.6 # 上下“安全墙”开始生效的余量。地面高度 z_min 时，z < z_min + margin 就开始快速增长惩罚
+height_barrier_sigma: 0.15  # 安全墙的“厚度/陡峭度”。越小越“硬”，接近边界惩罚飙升；越大越柔和
+height_gate_min: 0.3        # 风险门控的最小倍率 g_min。高风险时高度惩罚会被放松，但不会低于这个比例
+height_gate_p: 2.0          # 风险门控的指数，p 越大：低风险时更“收紧”，高风险时更“放开”p=1 是线性。
+height_w_floor: 2.0         # 地面 barrier 的权重。越大越“硬地面”，贴近地面惩罚更重
+height_w_ceil: 3.0          # 天花板 barrier 的权重。越大越“硬天花板”，靠近顶端惩罚更重。
 reach_goal_dis: 2.0
-# "Touch" radius used in reward shaping (slow down / stop shaping).
-# Default equals reach_goal_dis to avoid a reward gap. Increase if you explicitly
-# want a larger slow-down zone near the goal.
-touch_goal_dis: 2.0
+goal_use_planar: true        # use XY distance/direction for goal shaping (do not penalize vertical detours)
+# "Touch" radius (unused by current reward; kept for compatibility).
+touch_goal_dis: 2.0 
 terminate_on_success: true
-
 # Training-time termination toggles (set false to penalize instead of terminate)
 terminate_on_vel_limit: true
 terminate_on_height_high: true
 vel_limit_penalty: 1.0
-height_high_penalty: 1.0
-success_bonus: 40.0
-time_penalty: 0.02
-
-# Make safety reward penalty-only (no extra reward when far from obstacles)
-safety_reward_max: 0.0
-
-# Risk-memory options (optimized for vertical FOV edge disappearance)
-lidar_risk_keep_far: false   # keep memory ONLY for top/bottom vertical edge bands (recommended)
-
-
+height_high_penalty: 10.0
+success_bonus: 100.0
+time_penalty: 0.003
+time_penalty_mode: constant   # stall|constant constant per-step cost to encourage shorter-time solutions
+time_penalty_stall_eps: 0.01
+time_penalty_stall_steps: 5
 # -----------------------------
 # Risk-aware reward (TTC-based)
-# -----------------------------
-goal_reward_type: exp
-goal_w_d: 3.0
-goal_w_theta: 0.8
-# Plan A: amplify goal progress
-# progress = (last_dis - dis_now) * goal_progress_scale
-# if goal_progress_scale_by_dt: progress /= dt
-# then clamp to [-goal_progress_clamp, goal_progress_clamp]
-goal_progress_scale: 1.0
-goal_progress_scale_by_dt: false
-goal_progress_clamp: 0.5
+goal_w_d: 22.0
+goal_w_theta: 0.08
 risk_gate_goal: true
-risk_gate_g_min: 0.3
+risk_gate_g_min: 0.45
 risk_relax_enable: true
-risk_relax_eta_j: 0.5
-risk_relax_eta_h: 0.5
-
+risk_relax_eta_j: 0.8
 risk_reward_enable: true
-# risk_cfg:
-#   T0: 3.0
-#   v_min: 0.1
-#   beta: 12.0
-#   max_range: 8.0
-#   alpha: 10.0
-#   rho0: 0.2
-#   w_r: 1.5
-
 risk_cfg:
   T0: 1.0
-  v_min: 0.05
-  beta: 10.0
-  max_range: 8.0
-  alpha: 10.0
-  rho0: 0.2
-  w_r: 1.0
-  # optional risk curriculum (linear schedule over frames)
-  w_r_start: 0.3
-  w_r_end: 1.0
-  w_r_steps: 10000000
+  v_min: 0.1
+  beta: 5.0
+  max_range: 5.0
+  alpha: 6.0
+  rho0: 0.6
+  w_r: 1.9
+  # --- CPA/VO unified risk (dominant) ---
+  use_cpa: true
+  cpa_T_h: 2.4             # horizon (s)越大：更早预警、远处也算风险
+  cpa_safe_margin: 0.0     # if cpa_R_safe not set, R_safe = safety_dis + margin
+  cpa_R_safe: 1.0          # 约等于 1.00m 距离障碍物表面开始避障
+  cpa_s_dist: 0.5          # distance smoothing (m)越大：斜率更缓，避免过激转向
+  cpa_t_min: 0.1           # ignore very-near-zero t* noise (s)t* < t_min 时风险被压制（避免噪声）t_min 越大，风险触发越晚
+  cpa_s_time: 0.9          # time smoothing (s)s_time 越大，触发更平滑
+  cpa_vt_min: 0.05         # tangential-speed threshold (m/s)越小：CPA 更容易启用
+  cpa_k_v: 5.5             # 值越大，从“不信 CPA”到“相信 CPA”切换更陡；
+  cpa_r_max: 2.8           # 距离 r 小于 r_max 时才更信 CPA；超过 r_max 会快速不信 CPA。
+  cpa_k_r: 1.9             # 值越大，离开 r_max 后权重掉得更快
+  cpa_w_floor: 0.6         # CPA minimum blend weight when vt is present当有切向速度时，CPA 至少占多少权重
+  cpa_w_floor_vt: 0.10     # apply w_floor only if vt_mag > this (m/s)
+  cpa_v2_min: 0.05         # if ||v_rel||^2 越大：更容易退回 TTC
+  cpa_flow_clip: 15.0      # clip flow magnitude (pixels) before conversion 越小：抑制噪声、但可能低估危险
+  # NeuFlow channel mapping (default:ch0 表示水平/方位方向流，ch1 表示垂直/俯仰方向流。)光流通道映射，不影响强弱，只影响方向正确性。
+  flow_h_chan: 0
+  flow_v_chan: 1
 
-collision_penalty: 20.0
+collision_penalty: 100.0
 collision_include_height: true
-
-# Debug prints are expensive; keep them off in training
 debug_print_reward: false
-# base env perf print (in isaac_env.py)
 debug_print_perf: false
 debug_print_perf_every: 50
-
 static_obs_height_range:
 - 4.0
 - 6.0

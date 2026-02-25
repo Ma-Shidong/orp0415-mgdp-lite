@@ -44,9 +44,9 @@ from .common import GAE
 @dataclass
 class PPOConfig:
     name: str = "ppo"
-    train_every: int = 64
-    ppo_epochs: int = 10 #4
-    num_minibatches: int = 8 #16
+    train_every: int = 256 # 每次 PPO 更新用多少数据
+    ppo_epochs: int = 4 #同一份 rollout 数据被重复用多少次
+    num_minibatches: int = 4 #16 每个 epoch 切成多少小批
 
     # whether to use privileged information
     priv_actor: bool = False
@@ -107,8 +107,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.001
-        self.clip_param = 0.1
+        self.entropy_coef = 0.01
+        self.clip_param = 0.2
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
         self.gae = GAE(0.99, 0.95)
@@ -177,8 +177,8 @@ class PPOPolicy(TensorDictModuleBase):
             self.actor.apply(init_)
             self.critic.apply(init_)
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=2e-4)
         self.value_norm = ValueNorm1(reward_spec.shape[-2:]).to(self.device)
 
     def __call__(self, tensordict: TensorDict):

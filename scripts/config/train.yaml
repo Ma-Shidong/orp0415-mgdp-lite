@@ -12,16 +12,17 @@ env: ${task.env}
 
 total_frames: 500_000_000
 max_iters: -1
-eval_interval: 1000
-save_interval: 1000
+eval_interval: 500
+save_interval: 500
 
 # Evaluation rollout length (steps). Higher = more accurate but slower and higher memory.
 eval_max_steps: 1024
 # If you save videos, keep this smaller to avoid huge files.
 eval_video_max_steps: 256
+record_video: false
 
 seed: 0
-# resume_checkpoint: /home/csj/orp/models/orp5.13.pt
+# resume_checkpoint: /home/csj/orp/models/orp6.1.pt
 resume_checkpoint: null  # set to a .pt path to continue training, keep null to start from scratch
 
 viewer:

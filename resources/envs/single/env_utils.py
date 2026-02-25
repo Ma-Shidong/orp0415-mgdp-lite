@@ -1,9 +1,10 @@
 import torch
 import numpy as np
 import random
+from omni.isaac.lab.terrains.height_field.utils import height_field_to_mesh
 
 
-def generate_obstacle_tensor(n, pos_x_range, pos_y_range, vel_range, rad_range, seed=None):
+def generate_obstacle_tensor(n, pos_x_range, pos_y_range, vel_range, rad_range, seed=None, min_sep=0.0, max_attempts=50):
     if seed is not None:
         np.random.seed(seed)
         random.seed(seed)
@@ -14,9 +15,23 @@ def generate_obstacle_tensor(n, pos_x_range, pos_y_range, vel_range, rad_range, 
     vel_min, vel_max = vel_range
     rad_min, rad_max = rad_range
 
+    min_sep_sq = float(min_sep) ** 2 if min_sep and min_sep > 0 else 0.0
+    placed = []
+
     for i in range(n):
         posx = random.uniform(posx_min, posx_max)
         posy = random.uniform(posy_min, posy_max)
+        if min_sep_sq > 0.0:
+            for _ in range(max_attempts):
+                too_close = False
+                for px, py in placed:
+                    if (posx - px) ** 2 + (posy - py) ** 2 < min_sep_sq:
+                        too_close = True
+                        break
+                if not too_close:
+                    break
+                posx = random.uniform(posx_min, posx_max)
+                posy = random.uniform(posy_min, posy_max)
         
         velocity_norm = random.uniform(vel_min, vel_max)
         angle = random.uniform(0, 2 * np.pi)
@@ -26,8 +41,104 @@ def generate_obstacle_tensor(n, pos_x_range, pos_y_range, vel_range, rad_range, 
         hit = 0
 
         obstacles[i] = [[posx, posy], [velx, vely], [rad, hit]]
+        placed.append((posx, posy))
 
     return obstacles
+
+
+@height_field_to_mesh
+def discrete_obstacles_uniform_terrain(difficulty, cfg):
+    """Discrete obstacles with optional uniform placement (grid-based)."""
+    # resolve terrain configuration
+    obs_height = cfg.obstacle_height_range[0] + difficulty * (
+        cfg.obstacle_height_range[1] - cfg.obstacle_height_range[0]
+    )
+
+    # switch parameters to discrete units
+    width_pixels = int(cfg.size[0] / cfg.horizontal_scale)
+    length_pixels = int(cfg.size[1] / cfg.horizontal_scale)
+    obs_height = int(obs_height / cfg.vertical_scale)
+    obs_width_min = int(cfg.obstacle_width_range[0] / cfg.horizontal_scale)
+    obs_width_max = int(cfg.obstacle_width_range[1] / cfg.horizontal_scale)
+    platform_width = int(cfg.platform_width / cfg.horizontal_scale)
+
+    # create discrete ranges for obstacle sizes
+    obs_width_range = np.arange(obs_width_min, obs_width_max, 4)
+    obs_length_range = np.arange(obs_width_min, obs_width_max, 4)
+    if obs_width_range.size == 0:
+        obs_width_range = np.array([max(1, obs_width_min)])
+    if obs_length_range.size == 0:
+        obs_length_range = np.array([max(1, obs_width_min)])
+
+    # candidate positions (fallback random)
+    obs_x_range = np.arange(0, width_pixels, 4)
+    obs_y_range = np.arange(0, length_pixels, 4)
+
+    # configure uniform placement
+    min_sep_m = float(getattr(cfg, "min_sep", 0.0) or 0.0)
+    grid_step_m = float(getattr(cfg, "grid_step", 0.0) or 0.0)
+    min_sep_px = int(min_sep_m / cfg.horizontal_scale) if min_sep_m > 0.0 else 0
+    grid_step_px = int(grid_step_m / cfg.horizontal_scale) if grid_step_m > 0.0 else 0
+    cell_px = max(obs_width_max, min_sep_px, grid_step_px, 4)
+
+    # create a terrain with a flat platform at the center
+    hf_raw = np.zeros((width_pixels, length_pixels))
+
+    use_uniform = (min_sep_px > 0) or (grid_step_px > 0)
+    cells = []
+    if use_uniform and cell_px > 0:
+        xs = np.arange(0, width_pixels, cell_px)
+        ys = np.arange(0, length_pixels, cell_px)
+        # platform bounds
+        x1 = (width_pixels - platform_width) // 2
+        x2 = (width_pixels + platform_width) // 2
+        y1 = (length_pixels - platform_width) // 2
+        y2 = (length_pixels + platform_width) // 2
+        for x in xs:
+            for y in ys:
+                cx = x + 0.5 * cell_px
+                cy = y + 0.5 * cell_px
+                if platform_width > 0 and (x1 <= cx < x2) and (y1 <= cy < y2):
+                    continue
+                cells.append((int(x), int(y)))
+        np.random.shuffle(cells)
+
+    # generate the obstacles
+    for i in range(cfg.num_obstacles):
+        if cfg.obstacle_height_mode == "choice":
+            height = np.random.choice([-obs_height, -obs_height // 2, obs_height // 2, obs_height])
+        elif cfg.obstacle_height_mode == "fixed":
+            height = obs_height
+        else:
+            raise ValueError(f"Unknown obstacle height mode '{cfg.obstacle_height_mode}'. Must be 'choice' or 'fixed'.")
+
+        width = int(np.random.choice(obs_width_range))
+        length = int(np.random.choice(obs_length_range))
+
+        if i < len(cells):
+            x0, y0 = cells[i]
+            x_start = x0 + np.random.randint(0, max(1, cell_px - width + 1))
+            y_start = y0 + np.random.randint(0, max(1, cell_px - length + 1))
+        else:
+            x_start = int(np.random.choice(obs_x_range))
+            y_start = int(np.random.choice(obs_y_range))
+
+        # clip start position to the terrain
+        if x_start + width > width_pixels:
+            x_start = width_pixels - width
+        if y_start + length > length_pixels:
+            y_start = length_pixels - length
+
+        hf_raw[x_start : x_start + width, y_start : y_start + length] = height
+
+    # clip the terrain to the platform
+    x1 = (width_pixels - platform_width) // 2
+    x2 = (width_pixels + platform_width) // 2
+    y1 = (length_pixels - platform_width) // 2
+    y2 = (length_pixels + platform_width) // 2
+    hf_raw[x1:x2, y1:y2] = 0
+
+    return np.rint(hf_raw).astype(np.int16)
 
 def generate_wall_tensor(n, width, height, fly_height=2.):
     walls = np.zeros((n, 4, 6))
@@ -40,12 +151,13 @@ def generate_wall_tensor(n, width, height, fly_height=2.):
 
     return walls
 
-def get_bound_misbehave(drone_pos, start_pos, target_pos):
+def get_bound_misbehave(drone_pos, start_pos, target_pos, max_dist=8.0):
     A = target_pos[:, 1] - start_pos[:, 1]
     B = start_pos[:, 0] - target_pos[:, 0] 
     C = target_pos[:, 0] * start_pos[:, 1] - start_pos[:, 0] * target_pos[:, 1]
     distance = torch.abs(A * drone_pos[:, 0] + B * drone_pos[:, 1] + C) / torch.sqrt(A**2 + B**2)
-    mask = distance > 8.0
+    max_dist = float(max_dist)
+    mask = distance > max_dist
     bound_misbehave = mask.unsqueeze(1)
 
     return bound_misbehave

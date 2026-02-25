@@ -17,11 +17,12 @@ lidar_risk_decay_tau: 1.0
 lidar_risk_clear_time: 3.0
 lidar_risk_clear_margin: 1.0
 lidar_risk_enable: true
+lidar_risk_virtual_decay_tau: 1.0
+lidar_risk_virtual_clear_time: 1.0
 bound_h: 1.
 flow_gap: 25
 flow_slide_window: 5
 
-lidar_effective_range: 8.0 #/m
 lidar_v_edge_margin_deg: 6.0 #/degree
 
 # --- match training env constraints ---
@@ -66,6 +67,3 @@ bound_restitution: 0.0
 collision_stop: true
 safety_dis: 0.3
 goal_acc_bias: 0.0  # m/s^2, set e.g. 0.5~2.0 if the policy refuses to go to goal
-
-# Risk-memory options (optimized for vertical FOV edge disappearance)
-lidar_risk_keep_far: false   # keep memory ONLY for top/bottom vertical edge bands (recommended)

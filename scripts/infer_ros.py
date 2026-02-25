@@ -293,8 +293,8 @@ class InferROS:
         self.prev_depth_smoothed = None
         self.prev_pos = None
         self.prev_rot = None
-        self.risk_depth = None
-        self.risk_age = None
+        self.risk_virtual_depth = None
+        self.risk_virtual_age = None
         self.last_target_acc = torch.zeros(1, 3, device=self.device)
 
         # defaults (match env)
@@ -348,8 +348,7 @@ class InferROS:
         self.lidar_risk_clear_margin = float(self.cfg.task.get("lidar_risk_clear_margin", 1.0))
         self.lidar_risk_enable = bool(self.cfg.task.get("lidar_risk_enable", True))
 
-        # Match env.py FOV-related keep/clear rule
-        self.lidar_effective_range = float(self.cfg.task.get("lidar_effective_range", 5.0))
+        # Match env.py vertical edge band definition
         self.lidar_v_edge_margin_deg = self.cfg.task.get("lidar_v_edge_margin_deg", None)
 
         self.flow_gap = int(self.cfg.task.flow_gap)
@@ -626,17 +625,18 @@ class InferROS:
         return torch.from_numpy(dist_map).to(self.device).view(1, 1, self.lidar_h_res, self.lidar_v_res)
 
     def _update_risk_layer(self, lidar_scan_dis: torch.Tensor) -> torch.Tensor:
-        """Apply the same FOV-aware keep+decay layer as env.py (distance space)."""
+        """Update virtual risk memory for top/bottom FOV edges (risk-only)."""
         if not self.lidar_risk_enable:
             return lidar_scan_dis
 
-        if self.risk_depth is None:
-            self.risk_depth = torch.full_like(lidar_scan_dis, self.lidar_range + self.lidar_risk_clear_margin)
-            self.risk_age = torch.zeros_like(lidar_scan_dis)
+        if self.risk_virtual_depth is None:
+            self.risk_virtual_depth = torch.full_like(lidar_scan_dis, self.lidar_range + self.lidar_risk_clear_margin)
+            self.risk_virtual_age = torch.zeros_like(lidar_scan_dis)
 
         decay_target = self.lidar_range + self.lidar_risk_clear_margin
+        decay_tau = float(self.cfg.task.get("lidar_risk_virtual_decay_tau", self.lidar_risk_decay_tau))
+        clear_time = float(self.cfg.task.get("lidar_risk_virtual_clear_time", self.lidar_risk_clear_time))
         dt = float(self.lidar_radial_dt)
-        eff_range = min(float(self.lidar_effective_range), float(self.lidar_range))
 
         v_margin = self.lidar_v_edge_margin_deg
         if v_margin is None:
@@ -647,37 +647,52 @@ class InferROS:
                 v_margin = 0.0
         v_margin = float(v_margin)
 
-        v_angles = torch.linspace(float(self.lidar_vfov[0]), float(self.lidar_vfov[1]), self.lidar_v_res, device=self.device)
+        v_angles = torch.linspace(
+            float(self.lidar_vfov[0]), float(self.lidar_vfov[1]),
+            self.lidar_v_res, device=self.device
+        )
         edge_v = (v_angles >= (float(self.lidar_vfov[1]) - v_margin)) | (v_angles <= (float(self.lidar_vfov[0]) + v_margin))
         edge_mask = edge_v.view(1, 1, 1, self.lidar_v_res).expand(1, 1, self.lidar_h_res, self.lidar_v_res)
 
         hit_mask = lidar_scan_dis < self.lidar_range
         nohit_mask = ~hit_mask
+        edge_hit = hit_mask & edge_mask
+        edge_nohit = nohit_mask & edge_mask
 
-        self.risk_depth = torch.where(hit_mask, lidar_scan_dis, self.risk_depth)
-        self.risk_age = torch.where(hit_mask, torch.zeros_like(self.risk_age), self.risk_age)
+        self.risk_virtual_depth = torch.where(edge_hit, lidar_scan_dis, self.risk_virtual_depth)
+        self.risk_virtual_age = torch.where(edge_hit, torch.zeros_like(self.risk_virtual_age), self.risk_virtual_age)
 
-        has_risk = self.risk_depth < self.lidar_range
-        keep_due_edge = edge_mask
-        keep_due_far = self.risk_depth > eff_range
-        keep_mask = nohit_mask & has_risk & (keep_due_edge | keep_due_far)
-        clear_now_mask = nohit_mask & (~keep_mask)
-
-        self.risk_age = torch.where(keep_mask, self.risk_age + dt, self.risk_age)
-        self.risk_age = torch.where(clear_now_mask, torch.zeros_like(self.risk_age), self.risk_age)
-
-        decay_factor = torch.exp(- (self.risk_age / max(self.lidar_risk_decay_tau, 1e-6)) ** 2)
-        risk_depth_decay = decay_target - (decay_target - self.risk_depth) * decay_factor
-        clear_decay_mask = (self.risk_age >= self.lidar_risk_clear_time) | (risk_depth_decay >= decay_target)
-
-        self.risk_depth = torch.where(
-            keep_mask,
-            torch.where(clear_decay_mask, torch.full_like(self.risk_depth, decay_target), risk_depth_decay),
-            self.risk_depth,
+        self.risk_virtual_depth = torch.where(
+            edge_mask,
+            self.risk_virtual_depth,
+            torch.full_like(self.risk_virtual_depth, decay_target),
         )
-        self.risk_depth = torch.where(clear_now_mask, torch.full_like(self.risk_depth, decay_target), self.risk_depth)
+        self.risk_virtual_age = torch.where(edge_mask, self.risk_virtual_age, torch.zeros_like(self.risk_virtual_age))
 
-        return torch.minimum(lidar_scan_dis, self.risk_depth)
+        has_risk = self.risk_virtual_depth < self.lidar_range
+        keep_mask = edge_nohit & has_risk
+        clear_now_mask = edge_nohit & (~keep_mask)
+
+        self.risk_virtual_age = torch.where(keep_mask, self.risk_virtual_age + dt, self.risk_virtual_age)
+        self.risk_virtual_age = torch.where(clear_now_mask, torch.zeros_like(self.risk_virtual_age), self.risk_virtual_age)
+
+        decay_factor = torch.exp(- (self.risk_virtual_age / max(decay_tau, 1e-6)) ** 2)
+        risk_depth_decay = decay_target - (decay_target - self.risk_virtual_depth) * decay_factor
+        clear_decay_mask = (self.risk_virtual_age >= clear_time) | (risk_depth_decay >= decay_target)
+
+        self.risk_virtual_depth = torch.where(
+            keep_mask,
+            torch.where(clear_decay_mask, torch.full_like(self.risk_virtual_depth, decay_target), risk_depth_decay),
+            self.risk_virtual_depth,
+        )
+        self.risk_virtual_depth = torch.where(
+            clear_now_mask,
+            torch.full_like(self.risk_virtual_depth, decay_target),
+            self.risk_virtual_depth,
+        )
+
+        self.lidar_scan_dis_risk = torch.minimum(lidar_scan_dis, self.risk_virtual_depth)
+        return lidar_scan_dis
 
     def _build_observation(self, lidar_dis: torch.Tensor, pos_w: torch.Tensor, vel_w: torch.Tensor, q_wxyz: torch.Tensor, goal_w: torch.Tensor) -> TensorDict:
         """Match env.py observation construction: lidar(4ch) + state(9)."""

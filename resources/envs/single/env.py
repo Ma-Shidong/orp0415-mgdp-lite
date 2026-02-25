@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 import torch.distributions as D
@@ -22,7 +23,6 @@ from omni.isaac.lab.assets import RigidObjectCfg, RigidObjectCollection, RigidOb
 
 class Env(IsaacEnv):
     def __init__(self, cfg, headless):
-        self.reward_effort_weight = cfg.task.reward_effort_weight
         self.time_encoding = cfg.task.time_encoding
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
@@ -44,9 +44,9 @@ class Env(IsaacEnv):
             torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
         )
 
-        self.safety_dis = 0.3
+        self.safety_dis = 0.25
         self.vel_min = 3.5
-        self.vel_max = 5.
+        self.vel_max = 7.
         self.acc_max = 10.
         self.virtual_ground = 0.5
         self.virtual_ceiling = 3.5
@@ -85,8 +85,20 @@ class Env(IsaacEnv):
         self.prev_depth_smoothed = None
         self.prev_pos = None
         self.prev_rot = None
-        self.risk_depth = None
-        self.risk_age = None
+        # Per-env temporal reset mask (depth/flow/radial caches) to avoid clearing *all*
+        # temporal buffers when only a subset of vectorized envs reset.
+        self._temporal_reset_mask = None  # torch.bool [num_envs]
+        self._temporal_reset_pending = False
+        # Per-env validity for radial-speed baseline (avoid mixing across episode boundaries).
+        self._radial_prev_valid = None  # torch.bool [num_envs]
+        # Optional debug scalars (broadcast per-env for logging)
+        self.temporal_reset_rate = None
+        self.radial_valid_ratio = None
+        self.radial_abs_mean = None
+        self.flow_abs_mean = None
+
+        self.risk_virtual_depth = None
+        self.risk_virtual_age = None
         self.set_dobs_state = None
         self.set_wall_state = None
         self.ray_hits_dir = None
@@ -97,48 +109,9 @@ class Env(IsaacEnv):
         self.radial_channel = None  # cached [N,1,H,W] normalized radial speed for risk reward
         self.trace_prob = None
         self.virtual_x_bound = None
-        self.reward_dobs_max = None
         self.speed_sum = None
         self.acc_sum = None
-        from types import SimpleNamespace
-
-        # --- reward_cfg default / compatibility ---
-        # Old P2M does not use reward_cfg, but some newer experiments add it.
-        # Keep it always defined to avoid AttributeError when accessing self.reward_cfg.
-        # Also support hydra "dotted-key" style like `reward_cfg.k_s: 5.0`.
-        from types import SimpleNamespace
-
-        # Default
-        self.reward_cfg = SimpleNamespace(k_s=1.0)
-
-        # Try to load from cfg.task.reward_cfg (nested style)
-        rcfg = None
-        try:
-            rcfg = cfg.task.get("reward_cfg", None)
-        except Exception:
-            rcfg = getattr(getattr(cfg, "task", None), "reward_cfg", None)
-
-        # If still None, try dotted key style
-        if rcfg is None:
-            try:
-                k_s = cfg.task.get("reward_cfg.k_s", None)
-            except Exception:
-                k_s = None
-                try:
-                    task_obj = getattr(cfg, "task", None)
-                    if task_obj is not None and hasattr(task_obj, "get"):
-                        k_s = task_obj.get("reward_cfg.k_s", None)
-                except Exception:
-                    k_s = None
-            if k_s is not None:
-                rcfg = {"k_s": float(k_s)}
-
-        # Apply
-        if rcfg is not None:
-            if isinstance(rcfg, dict):
-                self.reward_cfg = SimpleNamespace(**rcfg)
-            else:
-                self.reward_cfg = rcfg
+        self.stall_count = None
 
 
     def _design_scene(self):
@@ -219,7 +192,6 @@ class Env(IsaacEnv):
         # default reserved open area width (clamped later against total size)
         # self.static_obs_platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width))
         self.static_obs_platform_width = float(self.cfg.task.get("static_obs_platform_width", 14.0))
-)
 
         # obstacle height configuration (from cfg.task)
         try:
@@ -260,35 +232,63 @@ class Env(IsaacEnv):
         )
 
         self._ground_prim_paths = []
+        self._ground_root_paths = []
         self._terrains = []
+        self._curriculum_static_obs_total = []
         num_levels = len(self._success_curriculum_levels) if self._curriculum_enabled else 1
+
+        def _level_cfg_get(level_cfg, key, default):
+            if level_cfg is None:
+                return default
+            getter = getattr(level_cfg, "get", None)
+            if getter is None:
+                return default
+            try:
+                return getter(key, default)
+            except Exception:
+                return default
+
+        self._ground_applied = False
 
         for lvl in range(num_levels):
             level_cfg = self._success_curriculum_levels[lvl] if self._curriculum_enabled else {}
             # Decide TOTAL number of static obstacles for this level.
             # Priority: per-level -> global -> legacy fallback
             try:
-                num_obs_total = int(level_cfg.get("static_obs_num_total", self.static_obs_num_total)) if isinstance(level_cfg, dict) else int(self.static_obs_num_total)
+                _sentinel = object()
+                raw_total = _level_cfg_get(level_cfg, "static_obs_num_total", _sentinel)
+                num_obs_total = int(raw_total) if raw_total is not _sentinel else int(self.static_obs_num_total)
             except Exception:
                 num_obs_total = int(self.static_obs_num_total)
 
             if num_obs_total <= 0:
                 # legacy fallback: treat per_grid as TOTAL if provided (to avoid breaking older configs)
-                num_obs_total = int(self.static_obs_num_per_grid)
+                try:
+                    raw_legacy = _level_cfg_get(level_cfg, "static_obs_num_per_grid", _sentinel)
+                    if raw_legacy is _sentinel:
+                        num_obs_total = int(self.static_obs_num_per_grid)
+                    else:
+                        num_obs_total = int(raw_legacy)
+                except Exception:
+                    num_obs_total = int(self.static_obs_num_per_grid)
 
             # Safety cap (TOTAL)
             try:
-                max_total = int(level_cfg.get("static_obs_max_total", self.static_obs_max_total)) if isinstance(level_cfg, dict) else int(self.static_obs_max_total)
+                max_total = int(_level_cfg_get(level_cfg, "static_obs_max_total", self.static_obs_max_total))
             except Exception:
                 max_total = int(self.static_obs_max_total)
             max_total = max(0, int(max_total))
             num_obs = max(0, min(int(num_obs_total), int(max_total)))
 
             # Optional: allow per-level platform width to reserve a free corridor
-# Optional: allow per-level platform width to reserve a free corridor
             try:
-                platform_width = float(level_cfg.get("static_obs_platform_width",
-                                      getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width)))
+                platform_width = float(
+                    _level_cfg_get(
+                        level_cfg,
+                        "static_obs_platform_width",
+                        getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width),
+                    )
+                )
             except Exception:
                 platform_width = float(getattr(self.cfg.task, "static_obs_platform_width", self.static_obs_platform_width))
             platform_width = max(0.0, platform_width)
@@ -300,7 +300,26 @@ class Env(IsaacEnv):
             if inner > 0.0:
                 platform_width = min(platform_width, max(0.0, inner - 0.1))
 
-            prim_path = "/World/ground" if lvl == 0 else f"/World/ground_l{lvl}"
+            root_path = "/World/ground" if lvl == 0 else f"/World/ground_l{lvl}"
+            prim_path = f"{root_path}/terrain"
+            try:
+                from omni.isaac.core.utils import prims as prim_utils
+                if not prim_utils.is_prim_path_valid(root_path):
+                    prim_utils.create_prim(root_path, "Xform")
+            except Exception:
+                pass
+            terrain_horizontal_scale = 0.1
+            width_min, width_max = self.static_obs_width_range
+            width_min = float(width_min)
+            width_max = float(width_max)
+            if width_min > width_max:
+                width_min, width_max = width_max, width_min
+            # Widths are in meters; IsaacLab converts to cells internally.
+            # Ensure we have a non-empty discrete range after integer conversion.
+            width_min = max(width_min, terrain_horizontal_scale)
+            width_max = max(width_max, width_min + terrain_horizontal_scale)
+            width_range = (width_min, width_max)
+
             terrain_cfg = TerrainImporterCfg(
                 prim_path=prim_path,
                 terrain_type="generator",
@@ -310,7 +329,7 @@ class Env(IsaacEnv):
                     border_width=min(max(self.terrain_border_width, 0.0), 0.5*min(self.terrain_total_size[0], self.terrain_total_size[1]) - 0.1),
                     num_rows=1,
                     num_cols=1,
-                    horizontal_scale=0.1,
+                    horizontal_scale=terrain_horizontal_scale,
                     vertical_scale=0.005,
                     slope_threshold=0.75,
                     use_cache=False,
@@ -318,12 +337,12 @@ class Env(IsaacEnv):
                     sub_terrains={
                         "obstacles": HfDiscreteObstaclesTerrainCfg(
                             size=(self.terrain_total_size[0], self.terrain_total_size[1]),
-                            horizontal_scale=0.1,
+                            horizontal_scale=terrain_horizontal_scale,
                             vertical_scale=0.1,
                             border_width=0.0,
                             num_obstacles=num_obs,
                             obstacle_height_mode="fixed",
-                            obstacle_width_range=self.static_obs_width_range,
+                            obstacle_width_range=width_range,
                             obstacle_height_range=(self.static_obs_height_range[0], self.static_obs_height_range[1]),
                             platform_width=platform_width,
                         ),
@@ -334,9 +353,22 @@ class Env(IsaacEnv):
                 collision_group=-1,
                 debug_vis=False,
             )
+            # More uniform static obstacle placement (optional)
+            try:
+                sub_cfg = terrain_cfg.terrain_generator.sub_terrains.get("obstacles", None)
+                if sub_cfg is not None:
+                    min_sep = float(self.cfg.task.get("static_obs_min_sep", 0.0))
+                    grid_step = float(self.cfg.task.get("static_obs_grid_step", 0.0))
+                    sub_cfg.function = env_utils.discrete_obstacles_uniform_terrain
+                    sub_cfg.min_sep = min_sep
+                    sub_cfg.grid_step = grid_step
+            except Exception:
+                pass
             terrain: TerrainImporter = terrain_cfg.class_type(terrain_cfg)
             self._terrains.append(terrain)
             self._ground_prim_paths.append(prim_path)
+            self._ground_root_paths.append(root_path)
+            self._curriculum_static_obs_total.append(int(num_obs))
 
         # curriculum switch handshake
         self._pending_curriculum_level = None
@@ -349,8 +381,27 @@ class Env(IsaacEnv):
         self.dynamic_obs_num = int(self.cfg.task.dynamic_obs_num)
         self.dobs_pos_x_range = (-18.0, 18.0)
         self.dobs_pos_y_range = (-18.0, 18.0)
-        self.dobs_vel_range = (1.0, 5.0)
-        self.dobs_rad_range = (0.25, 0.45)
+        # Allow config overrides for dynamic obstacle speed/size.
+        def _read_range(key, default):
+            try:
+                val = self.cfg.task.get(key, None)
+                if val is None:
+                    return default
+                return (float(val[0]), float(val[1]))
+            except Exception:
+                return default
+        self.dobs_vel_range = _read_range("dobs_vel_range", (1.0, 5.0))
+        self.dobs_rad_range = _read_range("dobs_rad_range", (0.25, 0.45))
+        dobs_vis_color = (1.0, 0.2, 0.2)
+        try:
+            color_cfg = self.cfg.task.get("dobs_vis_color", None)
+        except Exception:
+            color_cfg = None
+        if color_cfg is not None:
+            try:
+                dobs_vis_color = tuple(float(c) for c in list(color_cfg)[:3])
+            except Exception:
+                dobs_vis_color = (1.0, 0.2, 0.2)
         if self.dynamic_obs_num <= 0:
             self.dynamic_obs_num = 0
             self.dobs_states = torch.zeros((0, 3, 2), device=self.device)
@@ -365,10 +416,12 @@ class Env(IsaacEnv):
                 self.dobs_vel_range,
                 self.dobs_rad_range,
                 self.seed,
+                min_sep=float(self.cfg.task.get("dobs_min_sep", 0.0)),
             )
-            self.dobs_states = torch.tensor(_dobs_states_np, device=self.device)
-            self.dobs_origins = self.dobs_states[:, 0]
-            self.dobs_rad = self.dobs_states[:, 2][:, 0]
+            self.dobs_states = torch.tensor(_dobs_states_np, device=self.device, dtype=torch.float32)
+            # Store immutable initial positions/radius for re-activation (avoid view aliasing).
+            self.dobs_origins = self.dobs_states[:, 0].clone()
+            self.dobs_rad = self.dobs_states[:, 2][:, 0].clone()
             dobs_cfg_dict = {}
             for i, origin in enumerate(self.dobs_origins):
                 cylinder_cfg = RigidObjectCfg(
@@ -376,6 +429,10 @@ class Env(IsaacEnv):
                     spawn=sim_utils.CylinderCfg(
                         radius=float(self.dobs_rad[i].item()),
                         height=self.dobs_height,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=dobs_vis_color,
+                            roughness=0.4,
+                        ),
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(
                             disable_gravity=True
                         ),
@@ -394,15 +451,24 @@ class Env(IsaacEnv):
         if getattr(self, "_curriculum_enabled", False) and len(getattr(self, "_success_curriculum_levels", [])) > 0:
             try:
                 level_cfg = self._success_curriculum_levels[int(getattr(self, "_curriculum_level", 0))]
-                self._dobs_active_num = int(level_cfg.get("dynamic_obs_active", self.dynamic_obs_num))
+                self._dobs_active_num = int(_level_cfg_get(level_cfg, "dynamic_obs_active", self.dynamic_obs_num))
             except Exception:
                 self._dobs_active_num = int(self.dynamic_obs_num)
         self._dobs_active_num = max(0, min(int(self._dobs_active_num), int(self.dynamic_obs_num)))
 
+        # Wall settings (used for wide horizontal obstacle)
         self.wall_num = 1
-        self.wall_width = 20
-        self.wall_height = 0.4
-        self.fly_height = 2.0
+        self.wall_width = float(self.cfg.task.get("wall_width", 20.0))
+        self.wall_height = float(self.cfg.task.get("wall_height", 0.4))
+        self.fly_height = float(self.cfg.task.get("fly_height", 2.0))
+        self.wall_enable_default = bool(self.cfg.task.get("wall_enable", True))
+        self._wall_active = self.wall_enable_default
+        if getattr(self, "_curriculum_enabled", False) and len(getattr(self, "_success_curriculum_levels", [])) > 0:
+            try:
+                level_cfg = self._success_curriculum_levels[int(getattr(self, "_curriculum_level", 0))]
+                self._wall_active = bool(_level_cfg_get(level_cfg, "wall_enable", self.wall_enable_default))
+            except Exception:
+                self._wall_active = self.wall_enable_default
         self.wall_states = env_utils.generate_wall_tensor(self.wall_num, self.wall_width, 
                                                           self.wall_height, self.fly_height)
         self.wall_origins = self.wall_states[..., :3]
@@ -513,12 +579,15 @@ class Env(IsaacEnv):
             "reward_jerk": UnboundedContinuousTensorSpec(1),
             "reward_height": UnboundedContinuousTensorSpec(1),
             "reward_goal": UnboundedContinuousTensorSpec(1),
-            "reward_safety": UnboundedContinuousTensorSpec(1),
-            "reward_dobs": UnboundedContinuousTensorSpec(1),
             "reward_risk": UnboundedContinuousTensorSpec(1),
             "reward_collision": UnboundedContinuousTensorSpec(1),
             "risk_smax": UnboundedContinuousTensorSpec(1),
             "goal_gate": UnboundedContinuousTensorSpec(1),
+            # Temporal observation diagnostics (debug / sanity-check)
+            "temporal_reset_rate": UnboundedContinuousTensorSpec(1),
+            "radial_valid_ratio": UnboundedContinuousTensorSpec(1),
+            "radial_abs_mean": UnboundedContinuousTensorSpec(1),
+            "flow_abs_mean": UnboundedContinuousTensorSpec(1),
             "plan_success": UnboundedContinuousTensorSpec(1),
             "flight_success": UnboundedContinuousTensorSpec(1),
 
@@ -587,8 +656,21 @@ class Env(IsaacEnv):
         level = int(level)
         self._curriculum_level = level
 
+        def _level_cfg_get(level_cfg, key, default):
+            if level_cfg is None:
+                return default
+            getter = getattr(level_cfg, "get", None)
+            if getter is None:
+                return default
+            try:
+                return getter(key, default)
+            except Exception:
+                return default
+
         # Switch terrain by moving active ground to z=0.
         prev_ground = getattr(self, "_active_ground_prim_path", None)
+        # Force a re-apply attempt; prims may not be ready on the first try.
+        self._ground_applied = False
         self._apply_ground_level(level)
         new_ground = getattr(self, "_active_ground_prim_path", None)
 
@@ -607,20 +689,70 @@ class Env(IsaacEnv):
                 print(f"[WARN] Failed to re-create lidar on curriculum switch: {e}")
 
         # Update active dynamic obstacles count.
+        prev_active = int(getattr(self, "_dobs_active_num", 0))
         try:
             cfg = self._success_curriculum_levels[level]
-            self._dobs_active_num = int(cfg.get("dynamic_obs_active", self.dynamic_obs_num))
+            self._dobs_active_num = int(_level_cfg_get(cfg, "dynamic_obs_active", self.dynamic_obs_num))
         except Exception:
             self._dobs_active_num = int(getattr(self, "dynamic_obs_num", 0))
         self._dobs_active_num = max(0, min(int(self._dobs_active_num), int(getattr(self, "dynamic_obs_num", 0))))
+        active = int(self._dobs_active_num)
+
+        # If we just activated new dynamic obstacles (e.g., L0->L2), restore their
+        # positions/velocities from the parked state so they become visible again.
+        if active > prev_active and getattr(self, "dobs_states", None) is not None:
+            num_new = int(active - prev_active)
+            if num_new > 0:
+                idx = slice(prev_active, active)
+                # restore positions
+                self.dobs_states[idx, 0] = self.dobs_origins[idx]
+                # re-sample velocities for newly activated obstacles
+                vel_min, vel_max = self.dobs_vel_range
+                vel_dtype = self.dobs_states.dtype
+                vel_norm = torch.empty((num_new,), device=self.device, dtype=vel_dtype).uniform_(
+                    float(vel_min), float(vel_max)
+                )
+                vel_ang = torch.empty((num_new,), device=self.device, dtype=vel_dtype).uniform_(
+                    0.0, 2.0 * math.pi
+                )
+                vel_xy = torch.stack([vel_norm * torch.cos(vel_ang), vel_norm * torch.sin(vel_ang)], dim=-1)
+                self.dobs_states[idx, 1] = vel_xy
+                # if we already have sim state, un-park their poses immediately
+                if getattr(self, "set_dobs_state", None) is not None:
+                    if self.set_dobs_state.ndim == 3:
+                        self.set_dobs_state[:, idx, :2] = self.dobs_origins[idx].unsqueeze(0)
+                        self.set_dobs_state[:, idx, 2] = self.dobs_height / 2
+                    else:
+                        self.set_dobs_state[idx, :2] = self.dobs_origins[idx]
+                        self.set_dobs_state[idx, 2] = self.dobs_height / 2
+
+        # Update wall enable by curriculum level.
+        try:
+            cfg = self._success_curriculum_levels[level]
+            self._wall_active = bool(_level_cfg_get(cfg, "wall_enable", self.wall_enable_default))
+        except Exception:
+            self._wall_active = bool(getattr(self, "wall_enable_default", True))
+        if getattr(self, "set_wall_state", None) is not None and getattr(self, "wall_origins", None) is not None:
+            if self._wall_active:
+                self.set_wall_state[..., :3] = self.wall_origins.reshape(self.wall_num * 4, 3)
+            else:
+                self.set_wall_state[..., :3] = 1.0e6
+            try:
+                self.wall.write_object_link_pose_to_sim(self.set_wall_state[..., :7])
+            except Exception:
+                pass
 
         # Immediately park inactive obstacles so the curriculum switch is visually correct.
         if getattr(self, "dobs", None) is not None and getattr(self, "set_dobs_state", None) is not None:
             active = int(self._dobs_active_num)
             total = int(getattr(self, "dynamic_obs_num", 0))
             if active < total:
-                self.set_dobs_state[active:, :2] = 1.0e6
-                self.set_dobs_state[active:, 2] = self.dobs_height / 2
+                if self.set_dobs_state.ndim == 3:
+                    self.set_dobs_state[:, active:, :2] = 1.0e6
+                    self.set_dobs_state[:, active:, 2] = self.dobs_height / 2
+                else:
+                    self.set_dobs_state[active:, :2] = 1.0e6
+                    self.set_dobs_state[active:, 2] = self.dobs_height / 2
                 try:
                     self.dobs.write_object_link_pose_to_sim(self.set_dobs_state[..., :7])
                 except Exception:
@@ -630,19 +762,32 @@ class Env(IsaacEnv):
         # Mirror static obs count for logging (terrain itself is already generated).
         try:
             cfg = self._success_curriculum_levels[level]
-            self.static_obs_num_per_grid = int(cfg.get("static_obs_num_per_grid", self.static_obs_num_per_grid))
+            _sentinel = object()
+            raw_total = _level_cfg_get(cfg, "static_obs_num_total", _sentinel)
+            num_obs_total = int(raw_total) if raw_total is not _sentinel else int(self.static_obs_num_per_grid)
+            if num_obs_total <= 0:
+                raw_legacy = _level_cfg_get(cfg, "static_obs_num_per_grid", _sentinel)
+                if raw_legacy is _sentinel:
+                    num_obs_total = int(self.static_obs_num_per_grid)
+                else:
+                    num_obs_total = int(raw_legacy)
+            self.static_obs_num_per_grid = int(num_obs_total)
         except Exception:
             pass
 
     def _apply_ground_level(self, active_level: int):
         """Move the active terrain to z=0 and park the rest far below."""
-        paths = getattr(self, "_ground_prim_paths", None)
-        if not paths:
+        mesh_paths = getattr(self, "_ground_prim_paths", None)
+        root_paths = getattr(self, "_ground_root_paths", None)
+        if not mesh_paths:
             return
+        if not root_paths or len(root_paths) != len(mesh_paths):
+            root_paths = mesh_paths
 
         active_level = int(active_level)
         self._active_ground_idx = active_level
-        self._active_ground_prim_path = paths[active_level]
+        self._active_ground_root_path = root_paths[active_level]
+        self._active_ground_prim_path = mesh_paths[active_level]
 
         # Always use UsdGeom Xform ops (do not rely on set_prim_property), otherwise
         # Hydra/scene delegate may warn that xformOp:translate does not exist.
@@ -650,9 +795,12 @@ class Env(IsaacEnv):
             from omni.isaac.core.utils.prims import get_prim_at_path
             from pxr import UsdGeom, Gf
 
-            for i, p in enumerate(paths):
+            applied = False
+            for i, p in enumerate(root_paths):
                 z = 0.0 if i == active_level else -1000.0 * (i + 1)
                 prim = get_prim_at_path(p)
+                if prim is None or not prim.IsValid():
+                    continue
                 xf = UsdGeom.Xformable(prim)
                 # Reuse translate op if present; otherwise add one.
                 tr_op = None
@@ -663,11 +811,15 @@ class Env(IsaacEnv):
                 if tr_op is None:
                     tr_op = xf.AddTranslateOp()
                 tr_op.Set(Gf.Vec3d(0.0, 0.0, float(z)))
+                applied = True
+            self._ground_applied = applied
         except Exception:
             # Best-effort; if translate ops fail, we will just keep terrains as-is.
             pass
 
     def _reset_idx(self, env_ids: torch.Tensor):
+        if not getattr(self, "_ground_applied", False):
+            self._apply_ground_level(int(getattr(self, "_curriculum_level", 0)))
         # Apply pending curriculum only when we are resetting *all* envs.
         if getattr(self, "_pending_curriculum_level", None) is not None:
             if int(env_ids.numel()) == int(self.num_envs):
@@ -683,6 +835,9 @@ class Env(IsaacEnv):
             self.acc_sum = torch.zeros(self.num_envs, 1, device=self.device)
         self.speed_sum[env_ids] = 0.0
         self.acc_sum[env_ids] = 0.0
+        if self.stall_count is None:
+            self.stall_count = torch.zeros(self.num_envs, 1, device=self.device)
+        self.stall_count[env_ids] = 0.0
 
         if (self.start_pos is None) & (self.target_pos is None):
             drones_per_side = self.cfg.env.num_envs // 4
@@ -726,20 +881,51 @@ class Env(IsaacEnv):
         # --- IMPORTANT: clear per-episode sensor/history states for the reset envs.
         # If not cleared, "risk depth decay" + radial estimation can carry stale values across resets,
         # causing immediate unsafe/NaN and repeated resets.
-        if self.risk_depth is not None:
-            self.risk_depth[env_ids] = self.lidar_range + self.lidar_risk_clear_margin
-        if self.risk_age is not None:
-            self.risk_age[env_ids] = 0.0
+        if self.risk_virtual_depth is not None:
+            self.risk_virtual_depth[env_ids] = self.lidar_range + self.lidar_risk_clear_margin
+        if self.risk_virtual_age is not None:
+            self.risk_virtual_age[env_ids] = 0.0
 
-        # Clear temporal buffers (they store tensors over *all* envs). Re-init next step.
-        self.depth_image_queue = None
-        self.prev_depth_smoothed = None
-        self.prev_pos = None
-        self.prev_rot = None
+        # --- Temporal buffer reset (vectorized-safe) ---
+        # NOTE:
+        #   depth_image_queue / dismap_image_queue / dismap_flow_queue store tensors for *all* envs.
+        #   Clearing them here would wipe history for every env whenever any single env resets,
+        #   which breaks temporal observations (radial / flow) under vectorized training.
+        #
+        # Strategy:
+        #   - If we are resetting ALL envs, it's safe to clear and re-init next step.
+        #   - If we are resetting a SUBSET, we mark those envs and patch the history in
+        #     _compute_state_and_obs using the freshly reset current frame/state.
+        if int(env_ids.numel()) == int(self.num_envs):
+            self.depth_image_queue = None
+            self.prev_depth_smoothed = None
+            self.prev_pos = None
+            self.prev_rot = None
 
-        # Flow history (optional; comment out if you want continuity across episodes)
-        self.dismap_image_queue = None
-        self.dismap_flow_queue = None
+            self.dismap_image_queue = None
+            self.dismap_flow_queue = None
+
+            self._temporal_reset_mask = None
+            self._temporal_reset_pending = False
+            self._radial_prev_valid = None
+        else:
+            if self._temporal_reset_mask is None:
+                self._temporal_reset_mask = torch.zeros(
+                    (self.num_envs,), dtype=torch.bool, device=self.device
+                )
+            self._temporal_reset_mask[env_ids] = True
+            self._temporal_reset_pending = True
+
+            # Mark radial baseline invalid for these envs for 1 step to avoid using the
+            # previous episode's state when computing radial speed.
+            if self._radial_prev_valid is None:
+                self._radial_prev_valid = torch.zeros(
+                    (self.num_envs,), dtype=torch.bool, device=self.device
+                )
+                # If we already have prev buffers, assume they are valid for the rest.
+                if (self.prev_depth_smoothed is not None) and (self.prev_pos is not None) and (self.prev_rot is not None):
+                    self._radial_prev_valid[:] = True
+            self._radial_prev_valid[env_ids] = False
 
         # Reset last distance-to-goal baseline ONLY for envs that are being reset.
         # IMPORTANT: do NOT overwrite all envs here, otherwise non-reset envs can get a huge
@@ -749,7 +935,11 @@ class Env(IsaacEnv):
                 self.last_dis2goal = torch.zeros((self.num_envs, 1), device=self.device)
             elif self.last_dis2goal.ndim == 1:
                 self.last_dis2goal = self.last_dis2goal.view(self.num_envs, 1)
-            init_dis = (self.target_pos[env_ids] - self.start_pos[env_ids]).norm(dim=-1)
+            goal_use_planar = bool(self.cfg.task.get("goal_use_planar", False))
+            if goal_use_planar:
+                init_dis = (self.target_pos[env_ids][..., :2] - self.start_pos[env_ids][..., :2]).norm(dim=-1)
+            else:
+                init_dis = (self.target_pos[env_ids] - self.start_pos[env_ids]).norm(dim=-1)
             if init_dis.ndim == 1:
                 init_dis = init_dis.view(-1, 1)
             self.last_dis2goal[env_ids] = init_dis
@@ -784,8 +974,12 @@ class Env(IsaacEnv):
                 active = int(getattr(self, "_dobs_active_num", self.dynamic_obs_num))
                 active = max(0, min(active, int(self.dynamic_obs_num)))
                 if active < int(self.dynamic_obs_num):
-                    self.set_dobs_state[active:, :2] = 1.0e6
-                    self.set_dobs_state[active:, 2] = self.dobs_height / 2
+                    if self.set_dobs_state.ndim == 3:
+                        self.set_dobs_state[:, active:, :2] = 1.0e6
+                        self.set_dobs_state[:, active:, 2] = self.dobs_height / 2
+                    else:
+                        self.set_dobs_state[active:, :2] = 1.0e6
+                        self.set_dobs_state[active:, 2] = self.dobs_height / 2
                     self.dobs_states[active:, 0, 0] = 1.0e6
                     self.dobs_states[active:, 0, 1] = 1.0e6
                     self.dobs_states[active:, 1].zero_()
@@ -798,6 +992,28 @@ class Env(IsaacEnv):
                 self._dobs_active_num = active
 
                 if active > 0:
+                    # If dynamic obstacles were previously parked (e.g., L0->L2),
+                    # restore any active slots that are still at far-away positions.
+                    if (self.dobs_states is not None) and (self.dobs_origins is not None):
+                        pos_xy = self.dobs_states[:active, 0]
+                        parked_mask = (pos_xy.abs() > 1.0e5).any(dim=-1)
+                        if parked_mask.any():
+                            idx = torch.nonzero(parked_mask, as_tuple=False).squeeze(1)
+                            if idx.numel() > 0:
+                                self.dobs_states[idx, 0] = self.dobs_origins[idx]
+                                vel_min, vel_max = self.dobs_vel_range
+                                vel_dtype = self.dobs_states.dtype
+                                vel_norm = torch.empty((idx.numel(),), device=self.device, dtype=vel_dtype).uniform_(
+                                    float(vel_min), float(vel_max)
+                                )
+                                vel_ang = torch.empty((idx.numel(),), device=self.device, dtype=vel_dtype).uniform_(
+                                    0.0, 2.0 * math.pi
+                                )
+                                vel_xy = torch.stack(
+                                    [vel_norm * torch.cos(vel_ang), vel_norm * torch.sin(vel_ang)], dim=-1
+                                )
+                                self.dobs_states[idx, 1] = vel_xy
+
                     self.dobs_states[:active, 1] = env_utils.update_dobs_vel(
                         self.device,
                         self.dobs_states[:active],
@@ -808,23 +1024,36 @@ class Env(IsaacEnv):
                         drone_pos_xy=drone_pos_xy,
                     )
                     set_dobs_vel = self.dobs_states[:active, 1]
-                    self.set_dobs_state[:active, :2] = self.dobs_states[:active, 0] + (set_dobs_vel * self.dt)
-                    self.set_dobs_state[:active, 2] = self.dobs_height / 2
-                    self.dobs_states[:active, 0] = self.set_dobs_state[:active, :2]
+                    new_xy = self.dobs_states[:active, 0] + (set_dobs_vel * self.dt)
+                    if self.set_dobs_state.ndim == 3:
+                        self.set_dobs_state[:, :active, :2] = new_xy.unsqueeze(0)
+                        self.set_dobs_state[:, :active, 2] = self.dobs_height / 2
+                        self.dobs_states[:active, 0] = self.set_dobs_state[0, :active, :2]
+                    else:
+                        self.set_dobs_state[:active, :2] = new_xy
+                        self.set_dobs_state[:active, 2] = self.dobs_height / 2
+                        self.dobs_states[:active, 0] = self.set_dobs_state[:active, :2]
 
                 # Park inactive obstacles far away
                 if active < int(self.dynamic_obs_num):
                     self.dobs_states[active:, 1].zero_()
                     self.dobs_states[active:, 0, 0] = 1.0e6
                     self.dobs_states[active:, 0, 1] = 1.0e6
-                    self.set_dobs_state[active:, :2] = 1.0e6
-                    self.set_dobs_state[active:, 2] = self.dobs_height / 2
+                    if self.set_dobs_state.ndim == 3:
+                        self.set_dobs_state[:, active:, :2] = 1.0e6
+                        self.set_dobs_state[:, active:, 2] = self.dobs_height / 2
+                    else:
+                        self.set_dobs_state[active:, :2] = 1.0e6
+                        self.set_dobs_state[active:, 2] = self.dobs_height / 2
 
             self.dobs.write_object_link_pose_to_sim(self.set_dobs_state[..., :7])
 
         if self.set_wall_state is None:
             self.set_wall_state = self.wall.data.default_object_state.clone()
-            self.set_wall_state[..., :3] = self.wall_origins.reshape(self.wall_num * 4, 3)
+            if getattr(self, "_wall_active", True):
+                self.set_wall_state[..., :3] = self.wall_origins.reshape(self.wall_num * 4, 3)
+            else:
+                self.set_wall_state[..., :3] = 1.0e6
             self.wall.write_object_link_pose_to_sim(self.set_wall_state[..., :7])
         # P2M-style action mapping: use raw policy action directly as target_acc input (no scaling/clamp).
         raw_action = tensordict[("agents", "action")]  # shape: [num_envs, 3]
@@ -859,6 +1088,13 @@ class Env(IsaacEnv):
     def _compute_state_and_obs(self):
         # Keep locals defined to avoid UnboundLocalError in optional branches / debug.
         dismap_image0 = None
+
+        # Vectorized-safe temporal reset: env ids that were reset since last obs compute.
+        temporal_reset_ids = None
+        if getattr(self, "_temporal_reset_pending", False) and (self._temporal_reset_mask is not None):
+            temporal_reset_ids = torch.nonzero(self._temporal_reset_mask, as_tuple=False).squeeze(-1)
+            if temporal_reset_ids.numel() == 0:
+                temporal_reset_ids = None
 
         self.drone_state = self.drone.get_state(env_frame=False)
         self.rpos = self.target_pos - self.drone_state[..., :3]
@@ -912,13 +1148,19 @@ class Env(IsaacEnv):
                 pos_w = pos_w.squeeze(1)
             self.dobs_hits_w = pos_w[:, None, :] + ray_dir_w * (self.lidar_range + 1.0)
 
-        self.wall_hits_w = env_utils.wall_lidar_hits(
-            self.lidar_range,
-            self.fly_height,
-            self.wall_sizes,
-            self.lidar.data.pos_w,
-            ray_dir_w
-        )
+        if getattr(self, "_wall_active", True):
+            self.wall_hits_w = env_utils.wall_lidar_hits(
+                self.lidar_range,
+                self.fly_height,
+                self.wall_sizes,
+                self.lidar.data.pos_w,
+                ray_dir_w
+            )
+        else:
+            pos_w = self.lidar.data.pos_w
+            if pos_w.ndim == 3 and pos_w.shape[1] == 1:
+                pos_w = pos_w.squeeze(1)
+            self.wall_hits_w = pos_w[:, None, :] + ray_dir_w * (self.lidar_range + 1.0)
 
         self.merged_hits = env_utils.merge_hit_points(
             self.dobs_hits_w,
@@ -950,22 +1192,23 @@ class Env(IsaacEnv):
             lidar_scan_dis.clamp_max(self.lidar_range),
             torch.full_like(lidar_scan_dis, self.lidar_range),
         )
+        # Keep a raw copy for safety/done and perception.
+        self.lidar_scan_dis_raw = lidar_scan_dis
 
-        # --- Optional "depth missing keep + decay" risk layer (works in distance space)
+        # --- Optional virtual risk memory for vertical FOV edges (risk-only)
         # New rule:
-        #   Keep+decay ONLY when obstacle can disappear through FOV boundaries (top/bottom elevation bands)
-        #   or when previous obstacle is beyond effective range (> lidar_effective_range).
-        #   Otherwise (interior + near), no-hit clears immediately.
-        if self.lidar_risk_enable and self.risk_depth is None:
-            self.risk_depth = torch.full_like(lidar_scan_dis, self.lidar_range + self.lidar_risk_clear_margin)
-            self.risk_age = torch.zeros_like(lidar_scan_dis)
+        #   Keep+decay ONLY for top/bottom edge bands (virtual sectors).
+        #   Does NOT alter perception or safety; used only for risk computation.
+        if self.lidar_risk_enable and self.risk_virtual_depth is None:
+            self.risk_virtual_depth = torch.full_like(lidar_scan_dis, self.lidar_range + self.lidar_risk_clear_margin)
+            self.risk_virtual_age = torch.zeros_like(lidar_scan_dis)
 
         if self.lidar_risk_enable:
             decay_target = self.lidar_range + self.lidar_risk_clear_margin
 
-            # --- knobs
-            eff_range = float(self.cfg.task.get("lidar_effective_range", 5.0))  # e.g. 5m
-            eff_range = min(eff_range, float(self.lidar_range))
+            # virtual decay controls (default ~1s)
+            decay_tau = float(self.cfg.task.get("lidar_risk_virtual_decay_tau", self.cfg.task.get("lidar_risk_decay_tau", 1.0)))
+            clear_time = float(self.cfg.task.get("lidar_risk_virtual_clear_time", self.cfg.task.get("lidar_risk_clear_time", 1.0)))
 
             # vertical edge band margin (deg). If not set, use ~1 vertical bin.
             v_margin = self.cfg.task.get("lidar_v_edge_margin_deg", None)
@@ -977,7 +1220,7 @@ class Env(IsaacEnv):
                     v_margin = 0.0
             v_margin = float(v_margin)
 
-            # --- build vertical edge mask: near top (52deg) or bottom (-7deg)
+            # --- build vertical edge mask: near top/bottom of FOV
             v_angles = torch.linspace(
                 float(self.lidar_vfov[0]), float(self.lidar_vfov[1]),
                 self.lidar_v_res, device=self.device
@@ -987,54 +1230,48 @@ class Env(IsaacEnv):
                 self.num_envs, 1, self.lidar_h_res, self.lidar_v_res
             )
 
-            # --- measurement masks
+            # --- measurement masks (raw)
             hit_mask = lidar_scan_dis < self.lidar_range
             nohit_mask = ~hit_mask
+            edge_hit = hit_mask & edge_mask
+            edge_nohit = nohit_mask & edge_mask
 
-            # --- update memory on hits
-            self.risk_depth = torch.where(hit_mask, lidar_scan_dis, self.risk_depth)
-            self.risk_age = torch.where(hit_mask, torch.zeros_like(self.risk_age), self.risk_age)
+            # update virtual memory on edge hits
+            self.risk_virtual_depth = torch.where(edge_hit, lidar_scan_dis, self.risk_virtual_depth)
+            self.risk_virtual_age = torch.where(edge_hit, torch.zeros_like(self.risk_virtual_age), self.risk_virtual_age)
 
-            # --- decide keep vs clear when no-hit
-            # risk exists iff stored depth is within lidar_range (cleared state is > lidar_range)
-            has_risk = self.risk_depth < self.lidar_range
+            # keep only for edge bands; clear outside edges
+            self.risk_virtual_depth = torch.where(edge_mask, self.risk_virtual_depth, torch.full_like(self.risk_virtual_depth, decay_target))
+            self.risk_virtual_age = torch.where(edge_mask, self.risk_virtual_age, torch.zeros_like(self.risk_virtual_age))
 
-            keep_due_edge = edge_mask
-            keep_far = bool(self.cfg.task.get("lidar_risk_keep_far", False))
-            if keep_far:
-                keep_due_far = self.risk_depth > eff_range  # last seen obstacle beyond effective range
-            else:
-                keep_due_far = torch.zeros_like(keep_due_edge, dtype=torch.bool)
+            # decide keep vs clear for edge no-hit
+            has_risk = self.risk_virtual_depth < self.lidar_range
+            keep_mask = edge_nohit & has_risk
 
-            keep_mask = nohit_mask & has_risk & (keep_due_edge | keep_due_far)
-            clear_now_mask = nohit_mask & (~keep_mask)
+            clear_now_mask = edge_nohit & (~keep_mask)
 
-            # --- age update:
-            # keep -> age grows; clear_now -> age reset
-            self.risk_age = torch.where(keep_mask, self.risk_age + self.dt, self.risk_age)
-            self.risk_age = torch.where(clear_now_mask, torch.zeros_like(self.risk_age), self.risk_age)
+            # age update
+            self.risk_virtual_age = torch.where(keep_mask, self.risk_virtual_age + self.dt, self.risk_virtual_age)
+            self.risk_virtual_age = torch.where(clear_now_mask, torch.zeros_like(self.risk_virtual_age), self.risk_virtual_age)
 
-            # --- decay ONLY where keep_mask is true
-            decay_factor = torch.exp(- (self.risk_age / max(self.lidar_risk_decay_tau, 1e-6)) ** 2)
-            risk_depth_decay = decay_target - (decay_target - self.risk_depth) * decay_factor
+            # decay only where keep_mask is true
+            decay_factor = torch.exp(- (self.risk_virtual_age / max(decay_tau, 1e-6)) ** 2)
+            risk_depth_decay = decay_target - (decay_target - self.risk_virtual_depth) * decay_factor
 
-            clear_decay_mask = (self.risk_age >= self.lidar_risk_clear_time) | (risk_depth_decay >= decay_target)
-
-            # apply decay/clear for keep region
-            self.risk_depth = torch.where(
+            clear_decay_mask = (self.risk_virtual_age >= clear_time) | (risk_depth_decay >= decay_target)
+            self.risk_virtual_depth = torch.where(
                 keep_mask,
-                torch.where(clear_decay_mask, torch.full_like(self.risk_depth, decay_target), risk_depth_decay),
-                self.risk_depth,
+                torch.where(clear_decay_mask, torch.full_like(self.risk_virtual_depth, decay_target), risk_depth_decay),
+                self.risk_virtual_depth,
             )
-            # immediate clear for interior+near no-hit
-            self.risk_depth = torch.where(
+            self.risk_virtual_depth = torch.where(
                 clear_now_mask,
-                torch.full_like(self.risk_depth, decay_target),
-                self.risk_depth,
+                torch.full_like(self.risk_virtual_depth, decay_target),
+                self.risk_virtual_depth,
             )
 
-            # fuse memory back
-            lidar_scan_dis = torch.minimum(lidar_scan_dis, self.risk_depth)
+            # risk-only fused distance
+            self.lidar_scan_dis_risk = torch.minimum(lidar_scan_dis, self.risk_virtual_depth)
 
 
 
@@ -1045,8 +1282,15 @@ class Env(IsaacEnv):
         self.lidar_scan_dis = lidar_scan_dis
         self.lidar_scan = self.lidar_range - lidar_scan_dis
 
-        distance = self.rpos.norm(dim=-1, keepdim=True)
-        target_dir = self.rpos / distance.clamp(1e-6)
+        goal_use_planar = bool(self.cfg.task.get("goal_use_planar", False))
+        if goal_use_planar:
+            rpos_xy = self.rpos[..., :2]
+            distance_xy = rpos_xy.norm(dim=-1, keepdim=True)
+            target_dir = torch.zeros_like(self.rpos)
+            target_dir[..., :2] = rpos_xy / distance_xy.clamp(1e-6)
+        else:
+            distance = self.rpos.norm(dim=-1, keepdim=True)
+            target_dir = self.rpos / distance.clamp(1e-6)
         vel_fb = (self.drone_state[..., 7:])[..., :3]
         vel_input = vel_fb/self.vel_max
         if self.actions is not None:
@@ -1060,6 +1304,13 @@ class Env(IsaacEnv):
             self.depth_image_queue = deque([self.lidar_scan_dis] * window, maxlen=window)
         else:
             self.depth_image_queue.append(self.lidar_scan_dis)
+
+        # Patch depth history for envs that were reset (avoid mixing across episodes).
+        if temporal_reset_ids is not None:
+            curr_depth = self.lidar_scan_dis
+            for _frame in self.depth_image_queue:
+                _frame[temporal_reset_ids] = curr_depth[temporal_reset_ids]
+
         depth_smoothed = torch.mean(torch.stack(list(self.depth_image_queue)), dim=0)
 
         radial_channel = torch.full_like(self.lidar_scan_dis, self.lidar_radial_invalid_value)
@@ -1115,9 +1366,24 @@ class Env(IsaacEnv):
             )
             radial_channel = radial_flat.reshape(self.num_envs, 1, *self.lidar_resolution)
 
+        # Apply per-env radial baseline validity: envs reset this step must output invalid radial.
+        if self._radial_prev_valid is not None:
+            invalid_env = (~self._radial_prev_valid).view(self.num_envs, 1, 1, 1)
+            radial_channel = torch.where(
+                invalid_env,
+                torch.full_like(radial_channel, self.lidar_radial_invalid_value),
+                radial_channel,
+            )
+
         self.prev_depth_smoothed = depth_smoothed
         self.prev_pos = self.drone_state[..., :3].squeeze(1)
         self.prev_rot = self.drone_state[..., 3:7].squeeze(1)
+
+        # Update per-env radial baseline validity.
+        if self._radial_prev_valid is None:
+            self._radial_prev_valid = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+        elif temporal_reset_ids is not None:
+            self._radial_prev_valid[temporal_reset_ids] = True
 
         # --- NeuFlow init (ONLY ONCE) ---
         if self.dismap_flow_size is None:
@@ -1155,6 +1421,13 @@ class Env(IsaacEnv):
                                             maxlen=int(self.cfg.task.flow_gap + 3))
         else:
             self.dismap_image_queue.append(scan4flow_scaled)
+
+        # Patch flow-image history for envs that were reset (avoid mixing across episodes).
+        if temporal_reset_ids is not None:
+            curr_img = scan4flow_scaled
+            for _img in self.dismap_image_queue:
+                _img[temporal_reset_ids] = curr_img[temporal_reset_ids]
+
         dismap_tensor = list(self.dismap_image_queue)
         dismap_image0 = torch.cat(dismap_tensor[:3], dim=1)
         dismap_image1 = torch.cat(dismap_tensor[-3:], dim=1)
@@ -1165,6 +1438,13 @@ class Env(IsaacEnv):
             self.dismap_flow_queue = deque([self.dismap_flow] * flow_slide_window, maxlen=flow_slide_window)
         else:
             self.dismap_flow_queue.append(self.dismap_flow)
+
+        # Patch flow history for envs that were reset (avoid mixing across episodes).
+        if temporal_reset_ids is not None:
+            curr_flow = self.dismap_flow
+            for _f in self.dismap_flow_queue:
+                _f[temporal_reset_ids] = curr_flow[temporal_reset_ids]
+
         self.dismap_flow_mean = torch.mean(torch.stack(list(self.dismap_flow_queue)), dim=0)
         self.dismap_flow_zoom = torch.nn.functional.interpolate(self.dismap_flow_mean.float(),
                                                                   self.lidar_resolution,
@@ -1193,6 +1473,34 @@ class Env(IsaacEnv):
 
         # cache radial channel for risk reward
         self.radial_channel = radial_channel
+
+        # --- Temporal observation diagnostics (for logging / sanity-check) ---
+        # These are lightweight per-env scalars to verify that flow / radial signals
+        # are actually non-trivial after vectorized resets.
+        with torch.no_grad():
+            radial_flat = radial_channel.view(self.num_envs, -1)
+            valid = radial_flat != float(self.lidar_radial_invalid_value)
+            self.radial_valid_ratio = valid.float().mean(dim=1, keepdim=True)
+            denom = valid.sum(dim=1, keepdim=True).clamp(min=1)
+            self.radial_abs_mean = torch.where(
+                valid, radial_flat.abs(), torch.zeros_like(radial_flat)
+            ).sum(dim=1, keepdim=True) / denom
+
+            flow_flat = flow_zoom.view(self.num_envs, -1)
+            self.flow_abs_mean = flow_flat.abs().mean(dim=1, keepdim=True)
+
+            if temporal_reset_ids is not None:
+                reset_rate = float(temporal_reset_ids.numel()) / float(self.num_envs)
+            else:
+                reset_rate = 0.0
+            self.temporal_reset_rate = torch.full(
+                (self.num_envs, 1), reset_rate, device=self.device, dtype=torch.float32
+            )
+
+        # Clear per-env temporal reset flags once we've patched the histories for this step.
+        if temporal_reset_ids is not None and (self._temporal_reset_mask is not None):
+            self._temporal_reset_mask[temporal_reset_ids] = False
+        self._temporal_reset_pending = False
 
         # ---- 4-channel perception: [depth(1), flow(2), radial(1)]
         self.dismap_stack = torch.cat([scan_normalized, flow_scaled, radial_channel], dim=1)
@@ -1261,18 +1569,29 @@ class Env(IsaacEnv):
         # -------------------------
         # task / geometry variables
         # -------------------------
-        distance = self.rpos.norm(dim=-1, keepdim=True)
-        dis2goal = distance.squeeze(-1)
+        # 3D distance (used for success/termination)
+        distance_3d = self.rpos.norm(dim=-1, keepdim=True)
+        dis2goal_3d = distance_3d.squeeze(-1)
+
+        # Shaping distance/direction (optionally planar to avoid penalizing vertical maneuvers)
+        goal_use_planar = bool(self.cfg.task.get("goal_use_planar", False))
+        if goal_use_planar:
+            rpos_xy = self.rpos[..., :2]
+            distance_shape = rpos_xy.norm(dim=-1, keepdim=True)
+            dis2goal = distance_shape.squeeze(-1)
+            vel_direction = rpos_xy / distance_shape.clamp_min(1e-6)
+        else:
+            distance_shape = distance_3d
+            dis2goal = dis2goal_3d
+            vel_direction = self.rpos / distance_shape.clamp_min(1e-6)
+
         height = self.drone_state[..., 2]
 
-        # goal thresholds
+        # goal thresholds (always evaluated in 3D)
         touch_goal_dis = float(self.cfg.task.get("touch_goal_dis", 3.0))
-        touch_goal_mask = dis2goal <= touch_goal_dis
+        touch_goal_mask = dis2goal_3d <= touch_goal_dis
         reach_goal_dis = float(self.cfg.task.get("reach_goal_dis", touch_goal_dis))
-        success_mask = (dis2goal <= reach_goal_dis)
-
-        # direction to goal (unit)
-        vel_direction = self.rpos / distance.clamp_min(1e-6)
+        success_mask = (dis2goal_3d <= reach_goal_dis)
 
         # drone velocities
         vel_w = self.drone.vel_w[..., :3]
@@ -1307,62 +1626,48 @@ class Env(IsaacEnv):
         # reward weights
         # -------------------------
         rw = self.cfg.task.get("reward_weights", {})
-        k_v = float(rw.get("k_v", 1.2))
-        k_a = float(rw.get("k_a", 0.6))
-        k_j = float(rw.get("k_j", 0.2))
-        k_h = float(rw.get("k_h", 0.3))
-        k_g = float(rw.get("k_g", 0.8))
-        k_s = float(rw.get("k_s", 1.0))
-        k_d = float(rw.get("k_d", 0.6))
+        w_v = float(rw.get("w_v", rw.get("k_v", 0.0)))
+        w_a = float(rw.get("w_a", rw.get("k_a", 0.6)))
+        w_j = float(rw.get("w_j", rw.get("k_j", 0.2)))
+        w_h = float(rw.get("w_h", rw.get("k_h", 0.3)))
+        w_g = float(rw.get("w_g", rw.get("k_g", 1.0)))
 
         # -------------------------
-        # state reward components
+        # state reward components (energy + jerk + height)
         # -------------------------
-        beta_vel, beta_acc = 2.0, 5.0
         vel_limit = 1.2 * self.vel_max
         acc_limit = 1.5 * self.acc_max
 
-        beta_hei = 2.0
-        hei_set_min = self.fly_height - self.height_bound / 2
-        hei_set_max = self.fly_height + self.height_bound / 2
+        height_ref = float(self.cfg.task.get("height_ref", self.fly_height))
 
-        vel_set_min, vel_set_max = self.vel_min, self.vel_max
-        acc_set_min, acc_set_max = self.acc_min, self.acc_max
-
-        reward_vel, reward_acc, reward_jerk, reward_height = self._compute_state_reward(
-            beta_vel, vel_set_min, vel_set_max, vel_magnitude,
-            beta_acc, acc_set_min, acc_set_max, acc_magnitude,
-            beta_hei, hei_set_min, hei_set_max, height,
-            acc, self.last_acc, touch_goal_mask
+        reward_acc, reward_jerk = self._compute_state_reward(
+            acc, self.last_acc, self.last_acc_valid
         )
-        reward_vel = reward_vel.view(-1, 1)
-        reward_acc = reward_acc.view(-1, 1)
-        reward_jerk = reward_jerk.view(-1, 1)
-        # Avoid applying jerk penalty across episode boundaries.
-        # Envs that were reset since the previous step have `last_acc_valid=False`.
-        if self.last_acc_valid is not None:
-            invalid = (~self.last_acc_valid).view(-1, 1)
-            if invalid.any():
-                reward_jerk = reward_jerk.clone()
-                reward_jerk[invalid] = 1.0
-        reward_height = reward_height.view(-1, 1)
+
+        # -------------------------
+        # speed reward (cruise speed shaping)
+        # R_v = exp(-((||v|| - v_ref)^2) / sigma_v^2)
+        # -------------------------
+        try:
+            v_ref = float(self.cfg.task.get("v_ref", self.cfg.task.get("speed_ref", (self.vel_min + self.vel_max) * 0.5)))
+        except Exception:
+            v_ref = float((self.vel_min + self.vel_max) * 0.5)
+        try:
+            sigma_v = float(self.cfg.task.get("sigma_v", self.cfg.task.get("speed_sigma", max(0.5, 0.2 * float(self.vel_max)))))
+        except Exception:
+            sigma_v = max(0.5, 0.2 * float(self.vel_max))
+        sigma_v = float(max(sigma_v, 1.0e-3))
+        reward_vel = torch.exp(-((vel_magnitude - v_ref) ** 2) / (sigma_v ** 2 + 1.0e-6)).view(-1, 1)
 
         # goal reward (ungated)
+        # goal reward (ungated)
+        # Use planar velocity/direction when goal_use_planar is enabled, so vertical maneuvers
+        # (e.g., going over/under a low wall) are not directly penalized by the goal shaping.
+        vel_vec_goal = self.drone.vel_w[..., :2] if goal_use_planar else self.drone.vel_w[..., :3]
         reward_goal = self._compute_goal_reward(
-            self.drone.vel_w[..., :3], vel_direction,
-            self.last_dis2goal, dis2goal,
-            touch_goal_mask
+            vel_vec_goal, vel_direction,
+            self.last_dis2goal, dis2goal
         ).view(-1, 1)
-
-        # legacy safety rewards (optional to keep for ablation)
-        reward_safety = self._compute_safety_reward(self.lidar_scan)
-        active = int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))
-        active = max(0, min(active, int(getattr(self, "dynamic_obs_num", 0))))
-        reward_dobs = self._compute_dobs_reward(
-            self.dobs_states[:active] if (active > 0 and self.dobs_states is not None) else None,
-            self.drone_state[..., :2].squeeze(1),
-            self.drone.vel_w[..., :2].squeeze(1),
-        )
 
         # -------------------------
         # risk scalar + gating / relax
@@ -1373,10 +1678,21 @@ class Env(IsaacEnv):
 
         if risk_gate_goal or risk_relax_enable or risk_reward_enable:
             radial = getattr(self, "radial_channel", None)
-            risk_smax = self._compute_risk_smax(self.lidar_scan_dis, radial)
+            lidar_for_risk = getattr(self, "lidar_scan_dis_risk", self.lidar_scan_dis)
+            risk_smax = self._compute_risk_smax(lidar_for_risk, radial, getattr(self, 'dismap_flow_zoom', None))
         else:
             risk_smax = torch.zeros(self.num_envs, device=self.device)
         risk_smax_col = risk_smax.view(-1, 1)
+
+        # height reward with deadband + barrier + risk gate
+        reward_height = self._compute_height_reward(
+            height,
+            height_ref,
+            risk_smax_col,
+            virtual_ground,
+            virtual_ceiling,
+            w_h,
+        )
 
         # goal gate g(risk)
         if risk_gate_goal:
@@ -1390,14 +1706,10 @@ class Env(IsaacEnv):
         # relax jerk & height constraints under high risk (reduce their weights, do not introduce drift)
         if risk_relax_enable:
             eta_j = float(self.cfg.task.get("risk_relax_eta_j", 0.5))
-            eta_h = float(self.cfg.task.get("risk_relax_eta_h", 0.5))
             eta_j = float(max(0.0, min(1.0, eta_j)))
-            eta_h = float(max(0.0, min(1.0, eta_h)))
-            k_j_eff = (k_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
-            k_h_eff = (k_h * (1.0 - eta_h * risk_smax_col)).clamp_min(0.0)
+            w_j_eff = (w_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
         else:
-            k_j_eff = torch.full_like(reward_jerk, k_j)
-            k_h_eff = torch.full_like(reward_height, k_h)
+            w_j_eff = torch.full_like(reward_jerk, w_j)
 
         # -------------------------
         # risk avoidance reward (soft threshold + smooth growth)
@@ -1410,36 +1722,17 @@ class Env(IsaacEnv):
             # base weight
             w_r = float(rcfg.get("w_r", 1.5))
 
-            # optional curriculum: linearly interpolate w_r over global frames
-            # risk_cfg: {w_r_start, w_r_end, w_r_steps}
-            if ("w_r_start" in rcfg) and ("w_r_end" in rcfg) and ("w_r_steps" in rcfg):
-                try:
-                    w_r_start = float(rcfg.get("w_r_start"))
-                    w_r_end = float(rcfg.get("w_r_end"))
-                    w_r_steps = float(rcfg.get("w_r_steps"))
-                    w_r_steps = max(w_r_steps, 1.0)
-                    frames = float(getattr(self, "_global_frame_count", 0))
-                    t = max(0.0, min(1.0, frames / w_r_steps))
-                    w_r = w_r_start + (w_r_end - w_r_start) * t
-                except Exception:
-                    pass
-
-
-            # baseline subtraction makes reward_risk=0 when risk_smax=0
-            baseline = F.softplus(torch.tensor(-alpha * rho0, device=self.device))
-            reward_risk = -w_r * (F.softplus(alpha * (risk_smax_col - rho0)) - baseline)
+            reward_risk = -w_r * F.softplus(alpha * (risk_smax_col - rho0))
 
         # -------------------------
         # total reward (before collision penalty)
         # -------------------------
         reward = (
-            k_v * reward_vel
-            + k_a * reward_acc
-            + k_j_eff * reward_jerk
-            + k_h_eff * reward_height
-            + k_g * reward_goal
-            + k_s * reward_safety
-            + k_d * reward_dobs
+            w_v * reward_vel
+            + w_a * reward_acc
+            + w_j_eff * reward_jerk
+            + reward_height
+            + w_g * reward_goal
             + reward_risk
         ).view(-1, 1)
 
@@ -1451,15 +1744,45 @@ class Env(IsaacEnv):
         # time penalty (optional)
         time_penalty = float(self.cfg.task.get("time_penalty", 0.0))
         if time_penalty != 0.0:
-            reward = reward - time_penalty
+            mode = str(self.cfg.task.get("time_penalty_mode", "constant")).lower()
+            if mode in ("stagnation", "stall", "stagnant"):
+                stall_eps = float(self.cfg.task.get("time_penalty_stall_eps", 0.01))
+                stall_steps = int(self.cfg.task.get("time_penalty_stall_steps", 10))
+                stall_eps = max(0.0, stall_eps)
+
+                last_d = self.last_dis2goal
+                if last_d.ndim == 2 and last_d.shape[-1] == 1:
+                    last_d = last_d.squeeze(-1)
+                last_d_col = last_d.view(-1, 1) if last_d.ndim == 1 else last_d
+                dis2goal_col = dis2goal.view(-1, 1) if dis2goal.ndim == 1 else dis2goal
+                progress = (last_d_col - dis2goal_col).view(-1, 1)
+                stalled = progress.abs() <= stall_eps
+
+                if self.stall_count is None:
+                    self.stall_count = torch.zeros(self.num_envs, 1, device=self.device)
+                self.stall_count = torch.where(
+                    stalled,
+                    self.stall_count + 1.0,
+                    torch.zeros_like(self.stall_count),
+                )
+
+                if stall_steps <= 0:
+                    penalty_mask = stalled
+                else:
+                    penalty_mask = self.stall_count >= float(stall_steps)
+                reward = reward - time_penalty * penalty_mask.float()
+            else:
+                reward = reward - time_penalty
 
         # -------------------------
         # termination masks
         # -------------------------
+        bound_line_max_dist = float(self.cfg.task.get("bound_line_max_dist", 8.0))
         bound_misbehave = env_utils.get_bound_misbehave(
             self.drone_state[..., :2].squeeze(1),
             self.start_pos[..., :2].squeeze(1),
             self.target_pos[..., :2].squeeze(1),
+            max_dist=bound_line_max_dist,
         )
         height_low = _to_col(self.drone.pos[..., 2] < virtual_ground)
         height_high = _to_col(self.drone.pos[..., 2] > virtual_ceiling)
@@ -1468,10 +1791,13 @@ class Env(IsaacEnv):
         acc_limit_mask = _to_col(acc.abs().amax(dim=-1, keepdim=True) > acc_limit)
 
         # nearest obstacle distance
+        lidar_for_safety = getattr(self, "lidar_scan_dis_raw", None)
+        if lidar_for_safety is None:
+            lidar_for_safety = self.lidar_scan_dis
         min_depth_map = torch.where(
-            self.lidar_scan_dis <= 1e-6,
-            torch.full_like(self.lidar_scan_dis, self.lidar_range),
-            self.lidar_scan_dis,
+            lidar_for_safety <= 1e-6,
+            torch.full_like(lidar_for_safety, self.lidar_range),
+            lidar_for_safety,
         )
         min_depth = einops.reduce(min_depth_map, "n 1 w h -> n 1", "min")
         safety_mask = _to_col(min_depth < self.safety_dis)
@@ -1613,15 +1939,13 @@ class Env(IsaacEnv):
         # -------------------------
         if self.cfg.task.get("debug_print_reward", False) and (int(self.progress_buf[0].item()) % 50) == 0:
             print(
-                f"\r vel: {(k_v * reward_vel[0]).item():.3f}, "
-                f"acc: {(k_a * reward_acc[0]).item():.3f}, "
-                f"jerk: {(k_j_eff[0] * reward_jerk[0]).item():.3f}, "
-                f"height: {(k_h_eff[0] * reward_height[0]).item():.3f}, "
-                f"goal: {(k_g * reward_goal[0]).item():.3f}, "
+                f"\r vel: {(w_v * reward_vel[0]).item():.3f}, "
+                f"acc: {(w_a * reward_acc[0]).item():.3f}, "
+                f"jerk: {(w_j_eff[0] * reward_jerk[0]).item():.3f}, "
+                f"height: {(w_h_eff[0] * reward_height[0]).item():.3f}, "
+                f"goal: {(w_g * reward_goal[0]).item():.3f}, "
                 f"gate: {goal_gate[0].item():.3f}, "
                 f"risk: {reward_risk[0].item():.3f}, "
-                f"safety: {(k_s * reward_safety[0]).item():.3f}, "
-                f"dobs: {(k_d * reward_dobs[0]).item():.3f}, "
                 f"coll: {reward_collision[0].item():.3f}, "
                 f"total: {reward[0].item():.3f}\r",
                 end="",
@@ -1636,14 +1960,21 @@ class Env(IsaacEnv):
         self.stats["reward_jerk"].add_(reward_jerk)
         self.stats["reward_height"].add_(reward_height)
         self.stats["reward_goal"].add_(reward_goal)
-        self.stats["reward_safety"].add_(reward_safety)
-        self.stats["reward_dobs"].add_(reward_dobs)
         self.stats["reward_risk"].add_(reward_risk)
         self.stats["reward_collision"].add_(reward_collision)
 
         # scalar diagnostics (store current-step values, not accumulated sums)
         self.stats["risk_smax"].copy_(risk_smax_col)
         self.stats["goal_gate"].copy_(goal_gate)
+        # Temporal observation diagnostics (current-step values)
+        if self.temporal_reset_rate is not None:
+            self.stats["temporal_reset_rate"].copy_(self.temporal_reset_rate)
+        if self.radial_valid_ratio is not None:
+            self.stats["radial_valid_ratio"].copy_(self.radial_valid_ratio)
+        if self.radial_abs_mean is not None:
+            self.stats["radial_abs_mean"].copy_(self.radial_abs_mean)
+        if self.flow_abs_mean is not None:
+            self.stats["flow_abs_mean"].copy_(self.flow_abs_mean)
 
         vel_magnitude_col = vel_magnitude.view(self.num_envs, 1)
         step_count = self.progress_buf.clamp_min(1.0).unsqueeze(1)
@@ -1669,8 +2000,12 @@ class Env(IsaacEnv):
         # Curriculum bookkeeping (global)
         lvl = int(getattr(self, "_curriculum_level", 0))
         self.stats["curriculum_level"] = torch.full((self.num_envs, 1), float(lvl), device=self.device)
+        if hasattr(self, "_curriculum_static_obs_total") and len(self._curriculum_static_obs_total) > lvl:
+            curr_obs_total = int(self._curriculum_static_obs_total[lvl])
+        else:
+            curr_obs_total = int(getattr(self, "static_obs_num_per_grid", 0))
         self.stats["curriculum_static_obs_num_per_grid"] = torch.full(
-            (self.num_envs, 1), float(getattr(self, "static_obs_num_per_grid", 0)), device=self.device
+            (self.num_envs, 1), float(curr_obs_total), device=self.device
         )
         self.stats["curriculum_dobs_active"] = torch.full(
             (self.num_envs, 1), float(int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))), device=self.device
@@ -1707,107 +2042,116 @@ class Env(IsaacEnv):
             self.batch_size,
         )
 
-    def _compute_state_reward(self, beta_vel, vel_set_min, vel_set_max, vel_magnitude,
-                            beta_acc, acc_set_min, acc_set_max, acc_magnitude,
-                            beta_hei, hei_set_min, hei_set_max, height, 
-                            acc, last_acc, touch_goal_mask):
-        if vel_magnitude.ndim == 2 and vel_magnitude.shape[-1] == 1:
-            vel_magnitude = vel_magnitude.squeeze(-1)
-        if touch_goal_mask.ndim == 2 and touch_goal_mask.shape[-1] == 1:
-            touch_goal_mask = touch_goal_mask.squeeze(-1)
-        reward_vel = torch.log(torch.exp(- beta_vel * (torch.clamp(vel_set_min - vel_magnitude, min = 0.)
-                                        + torch.clamp(vel_magnitude - vel_set_max, min = 0.))) + 1.)
-        reward_vel[touch_goal_mask] = torch.log(torch.exp(- beta_vel * torch.clamp(
-                                        vel_magnitude[touch_goal_mask] - vel_set_max, min = 0.)) + 1.)
-        reward_acc = torch.log(torch.exp(- beta_acc * (torch.clamp(acc_set_min - acc_magnitude, min = 0.)
-                                        + torch.clamp(acc_magnitude - acc_set_max, min = 0.))) + 1.)
-        reward_jerk = 1. / (1. + torch.norm(acc - last_acc, dim=-1, keepdim=True))
-        reward_height = torch.log(torch.exp(- beta_hei * (torch.clamp(hei_set_min - height, min = 0.)
-                                        + torch.clamp(height - hei_set_max, min = 0.))) + 1.)
+    def _compute_state_reward(self, acc, last_acc, last_acc_valid=None):
+        acc_sq = (acc ** 2).sum(dim=-1, keepdim=True)
+        jerk_sq = ((acc - last_acc) ** 2).sum(dim=-1, keepdim=True)
+        if last_acc_valid is not None:
+            invalid = (~last_acc_valid).view(-1, 1)
+            jerk_sq = torch.where(invalid, torch.zeros_like(jerk_sq), jerk_sq)
+        reward_acc = -acc_sq
+        reward_jerk = -jerk_sq
+        return reward_acc, reward_jerk
 
-        return reward_vel, reward_acc, reward_jerk, reward_height
+    def _compute_height_reward(self, height, height_ref, risk_smax, z_min, z_max, w_h):
+        if height.ndim == 2 and height.shape[-1] == 1:
+            height_col = height
+        else:
+            height_col = height.view(-1, 1)
 
-    def _compute_goal_reward(self, vel_vector, vel_direction, last_dis2goal, dis2goal, touch_goal_mask):
-        """Goal progress reward.
+        # deadband parameters
+        delta = float(self.cfg.task.get("height_deadband", self.cfg.task.get("height_huber_delta", 0.5)))
+        sigma_z = float(self.cfg.task.get("height_band_sigma", 0.6))
+        delta = max(delta, 0.0)
+        sigma_z = max(sigma_z, 1.0e-6)
 
-        Controlled by cfg.task.goal_reward_type:
-        - 'linear' (recommended): w_d*(d_prev - d_now) + w_theta*cos(theta)
-        - 'exp' (legacy): direction + 10*(exp(Δd) - 1), where Δd = d_prev - d_now
-        """
-        goal_type = str(self.cfg.task.get("goal_reward_type", "exp")).lower()
+        # barrier parameters
+        margin = float(self.cfg.task.get("height_barrier_margin", 0.3))
+        sigma_b = float(self.cfg.task.get("height_barrier_sigma", 0.15))
+        margin = max(margin, 0.0)
+        sigma_b = max(sigma_b, 1.0e-6)
 
-        # squeeze common shapes
+        # risk gate parameters
+        g_min = float(self.cfg.task.get("height_gate_min", 0.2))
+        p = float(self.cfg.task.get("height_gate_p", 2.0))
+        g_min = float(max(0.0, min(1.0, g_min)))
+        p = max(p, 0.0)
+
+        # weights
+        w_f = float(self.cfg.task.get("height_w_floor", 2.0))
+        w_c = float(self.cfg.task.get("height_w_ceil", 2.0))
+
+        # deadband
+        err = (height_col - float(height_ref)).abs()
+        e = torch.clamp(err - delta, min=0.0)
+
+        # huber on normalized error
+        x = e / sigma_z
+        ax = x.abs()
+        huber = torch.where(ax <= 1.0, 0.5 * x * x, ax - 0.5)
+
+        # risk gate (high risk -> looser height constraint)
+        if risk_smax.ndim == 1:
+            risk_col = risk_smax.view(-1, 1)
+        else:
+            risk_col = risk_smax
+        g = g_min + (1.0 - g_min) * torch.pow(1.0 - risk_col, p)
+        g = torch.clamp(g, g_min, 1.0)
+
+        # soft barriers near ground/ceiling
+        P_floor = F.softplus(((float(z_min) + margin) - height_col) / sigma_b) ** 2
+        P_ceil = F.softplus((height_col - (float(z_max) - margin)) / sigma_b) ** 2
+
+        reward_height = -w_h * g * huber - w_f * P_floor - w_c * P_ceil
+        return reward_height
+
+    def _compute_goal_reward(self, vel_vector, goal_direction, last_dis2goal, dis2goal):
+        """Goal reward = progress + heading alignment."""
+        last_d = last_dis2goal.squeeze(-1) if last_dis2goal.ndim == 2 else last_dis2goal
+        d_now = dis2goal.squeeze(-1) if dis2goal.ndim == 2 else dis2goal
+
+        w_d = float(self.cfg.task.get("goal_w_d", 1.0))
+        w_theta = float(self.cfg.task.get("goal_w_theta", 1.0))
         if vel_vector.ndim == 3 and vel_vector.shape[1] == 1:
             vel_vec = vel_vector.squeeze(1)
         else:
             vel_vec = vel_vector
-        if vel_direction.ndim == 3 and vel_direction.shape[1] == 1:
-            vel_dir = vel_direction.squeeze(1)
+        if goal_direction.ndim == 3 and goal_direction.shape[1] == 1:
+            goal_dir = goal_direction.squeeze(1)
         else:
-            vel_dir = vel_direction
+            goal_dir = goal_direction
 
-        last_d = last_dis2goal.squeeze(-1) if last_dis2goal.ndim == 2 else last_dis2goal
-        d_now = dis2goal.squeeze(-1) if dis2goal.ndim == 2 else dis2goal
-        touch_mask = touch_goal_mask.squeeze(-1) if (touch_goal_mask.ndim == 2 and touch_goal_mask.shape[-1] == 1) else touch_goal_mask
+        # Projected progress along the goal direction (meters per step).
+        # This avoids over-penalizing lateral maneuvers (e.g., going around/over/under obstacles)
+        # while still rewarding motion that advances toward the goal.
+        # NOTE: last_dis2goal/d_now are still tracked elsewhere for stats/optional penalties.
+        progress = (vel_vec * goal_dir).sum(-1) * float(self.dt)
 
-        if goal_type == "linear":
-            w_d = float(self.cfg.task.get("goal_w_d", 10.0))
-            w_theta = float(self.cfg.task.get("goal_w_theta", 1.0))
+        vel_norm = vel_vec.norm(dim=-1).clamp_min(1e-6)
+        cos_theta = (vel_vec * goal_dir).sum(-1) / vel_norm
+        cos_theta = cos_theta.clamp(-1.0, 1.0)
 
-            # progress shaping (delta distance). Support optional scaling / dt normalization.
-            progress = (last_d - d_now)
-            try:
-                progress_scale = float(self.cfg.task.get("goal_progress_scale", 1.0))
-            except Exception:
-                progress_scale = 1.0
-            progress = progress * progress_scale
-
-            # Plan A option: normalize by dt (turn into progress speed)
-            try:
-                scale_by_dt = bool(self.cfg.task.get("goal_progress_scale_by_dt", False))
-            except Exception:
-                scale_by_dt = False
-            if scale_by_dt:
-                dt = float(getattr(self, "dt", 0.0))
-                if dt > 1e-6:
-                    progress = progress / dt
-
-            # clamp to avoid extreme spikes
-            try:
-                clamp_val = float(self.cfg.task.get("goal_progress_clamp", 1.0))
-            except Exception:
-                clamp_val = 1.0
-            if clamp_val > 0:
-                progress = progress.clamp(min=-clamp_val, max=clamp_val)
-
-
-            speed = vel_vec.norm(dim=-1).clamp_min(1e-6)
-            v_dir = vel_vec / speed.unsqueeze(-1)
-            cos_theta = (v_dir * vel_dir).sum(-1).clamp(-1.0, 1.0)
-
-            reward_goal = w_d * progress + w_theta * cos_theta
-            reward_goal[touch_mask] = 0.0
-            return reward_goal
-
-        # legacy exp shaping (default)
-        reward_goal_dir = (vel_vec * vel_dir).sum(-1).clip(max=2.0)
-        delta_dis = (last_d - d_now).clamp(min=-3.0, max=3.0)
-        reward_goal_dis = (torch.exp(delta_dis) - 1.0) * 10.0
-        reward_goal_dis[touch_mask] = 0.0
-        reward_goal = reward_goal_dir + reward_goal_dis
+        reward_goal = w_d * progress + w_theta * cos_theta
         return reward_goal
 
-        
-
-    def _compute_risk_smax(self, lidar_scan_dis: torch.Tensor, radial_channel: torch.Tensor) -> torch.Tensor:
+    def _compute_risk_smax(self, lidar_scan_dis: torch.Tensor, radial_channel: torch.Tensor, flow: torch.Tensor = None) -> torch.Tensor:
         """Compute differentiable global risk scalar R^{smax} in [0, 1].
 
-        Per-sector risk is defined as:
-            TTC^{ij} = r^{ij} / max(v_c^{ij}, v_min)
-            H^{ij}   = clip(T0 / TTC^{ij}, 0, 1)
+        Unified collision-risk criterion (dynamic + static):
+            - Dominant: CPA (Closest Point of Approach) based hazard using 3D relative velocity
+              estimated from (radial residual + tangential flow).
+            - Fallback: TTC-style radial closing hazard (robust when flow is unreliable).
 
-        We aggregate H using a masked softmax to preserve max-like behavior while keeping
-        the mapping smooth and differentiable.
+        Per-sector CPA:
+            r_vec = r * e_r
+            v_rel = r_dot * e_r + v_t
+            t*    = clip( - <r_vec, v_rel> / (||v_rel||^2 + eps), 0, T_h )
+            d_cpa = || r_vec + v_rel * t* ||
+            H_cpa = sigmoid((R_safe - d_cpa)/s_dist) * sigmoid((t* - t_min)/s_time)
+
+        We blend CPA and TTC hazards using a confidence weight w in [0, 1]:
+            H = (1 - w) * H_ttc + w * H_cpa
+
+        Finally, aggregate H with masked-softmax to get a single scalar risk_smax.
         """
         if lidar_scan_dis.ndim == 3:
             lidar_scan_dis = lidar_scan_dis.unsqueeze(1)
@@ -1820,28 +2164,51 @@ class Env(IsaacEnv):
             radial_channel = radial_channel[:, :1, ...]
 
         rcfg = self.cfg.task.get("risk_cfg", {})
+
+        # --- TTC fallback parameters ---
         T0 = float(rcfg.get("T0", 3.0))
         v_min = float(rcfg.get("v_min", 0.1))
         beta = float(rcfg.get("beta", 10.0))
 
         max_range = rcfg.get("max_range", None)
         if max_range is None:
-            max_range = float(self.cfg.task.get("lidar_effective_range", self.lidar_range))
+            max_range = float(self.lidar_range)
         max_range = min(float(max_range), float(self.lidar_range))
 
-        # closing speed (m/s)
-        #   closing = ego_closing_along_ray + residual_closing_from_dynamic_obstacles
-        # residual closing: radial channel is normalized by lidar_radial_max_speed
+        # --- CPA dominant parameters ---
+        use_cpa = bool(rcfg.get("use_cpa", True))
+        T_h = float(rcfg.get("cpa_T_h", rcfg.get("T_h", 2.5)))
+        s_dist = float(rcfg.get("cpa_s_dist", rcfg.get("s_dist", 0.3)))
+        t_min = float(rcfg.get("cpa_t_min", rcfg.get("t_min", 0.1)))
+        s_time = float(rcfg.get("cpa_s_time", rcfg.get("s_time", 0.2)))
+        safe_margin = float(rcfg.get("cpa_safe_margin", 0.15))
+        R_safe = float(rcfg.get("cpa_R_safe", float(self.safety_dis) + safe_margin))
+
+        vt_min = float(rcfg.get("cpa_vt_min", 0.15))
+        k_v = float(rcfg.get("cpa_k_v", 6.0))
+        r_max = float(rcfg.get("cpa_r_max", max_range))
+        k_r = float(rcfg.get("cpa_k_r", 2.0))
+        w_floor = float(rcfg.get("cpa_w_floor", 0.35))
+        w_floor_vt = float(rcfg.get("cpa_w_floor_vt", 0.05))
+        v2_min = float(rcfg.get("cpa_v2_min", 0.02))
+        flow_clip = float(rcfg.get("cpa_flow_clip", 15.0))
+        flow_h_chan = int(rcfg.get("flow_h_chan", 0))
+        flow_v_chan = int(rcfg.get("flow_v_chan", 1))
+
+        # -------------------------
+        # Compute radial closing and TTC hazard (fallback)
+        # -------------------------
+        r = lidar_scan_dis.clamp_min(1e-3)
+
+        # residual radial speed (m/s): radial channel is normalized by lidar_radial_max_speed
         radial_speed = radial_channel.float() * float(self.lidar_radial_max_speed)
 
-        # --- ego velocity projection onto rays (covers static obstacles) ---
+        # ego velocity projection onto rays (static obstacle closing)
         ego_closing = torch.zeros_like(lidar_scan_dis)
         ray_dir = getattr(self, "input_dir", None)
         if ray_dir is not None:
-            # ray_dir is in yaw-only lidar frame (attach_yaw_only)
             ray_dir_flat = ray_dir.reshape(ray_dir.shape[0], -1, 3).float()
 
-            # drone velocity in yaw-only frame
             vel_w = self.drone.vel_w[..., :3]
             if vel_w.ndim == 3 and vel_w.shape[1] == 1:
                 vel_w = vel_w.squeeze(1)
@@ -1858,22 +2225,134 @@ class Env(IsaacEnv):
             ego_proj = torch.clamp(ego_proj, min=0.0)
             ego_closing = ego_proj.reshape(lidar_scan_dis.shape[0], 1, *self.lidar_resolution)
 
+        # closing_raw > 0 means range decreasing (approaching)
         closing_raw = ego_closing + radial_speed
         closing_pos = torch.clamp(closing_raw, min=0.0)
-        # only apply v_min when approaching; otherwise keep 0 to avoid false risk
         closing = torch.where(
             closing_pos > 0.0,
             torch.maximum(closing_pos, closing_pos.new_tensor(v_min)),
             torch.zeros_like(closing_pos),
         )
 
-        r = lidar_scan_dis.clamp_min(1e-3)
-        H = (T0 * closing / r).clamp(0.0, 1.0)
+        H_ttc = (T0 * closing / r).clamp(0.0, 1.0)
 
         # mask out very far cells (avoid gradient dilution)
         mask = lidar_scan_dis < max_range
-        H = torch.where(mask, H, torch.zeros_like(H))
+        H_ttc = torch.where(mask, H_ttc, torch.zeros_like(H_ttc))
 
+        # -------------------------
+        # CPA dominant hazard using tangential flow + radial range rate
+        # -------------------------
+        H = H_ttc
+        if use_cpa and (flow is not None) and (ray_dir is not None):
+            # sanitize flow
+            if flow.ndim == 3:
+                flow = flow.unsqueeze(1)
+            if flow.ndim == 4 and flow.size(1) < 2:
+                flow = None
+
+        if use_cpa and (flow is not None) and (ray_dir is not None):
+            flow = torch.nan_to_num(flow.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            flow = torch.clamp(flow, -flow_clip, flow_clip)
+
+            # time gap of flow estimation (seconds)
+            flow_gap = float(self.cfg.task.get("flow_gap", 1.0))
+            dt_flow = float(self.dt) * max(flow_gap, 1.0)
+            dt_flow = max(dt_flow, 1.0e-6)
+
+            # angles span (radians)
+            hfov_rad = float(self.lidar_hfov) * float(torch.pi) / 180.0
+            vfov_span_rad = float(self.lidar_vfov[1] - self.lidar_vfov[0]) * float(torch.pi) / 180.0
+
+            # base flow resolution (pixels)
+            try:
+                flow_H, flow_W = getattr(self, "dismap_flow_size", self.lidar_resolution)
+                flow_H = float(flow_H)
+                flow_W = float(flow_W)
+            except Exception:
+                flow_H, flow_W = float(self.lidar_resolution[0]), float(self.lidar_resolution[1])
+            flow_H = max(flow_H, 1.0)
+            flow_W = max(flow_W, 1.0)
+
+            # channel mapping (default: ch0 -> horizontal/azimuth, ch1 -> vertical/elevation)
+            flow_h = flow[:, flow_h_chan, :, :]
+            flow_v = flow[:, flow_v_chan, :, :]
+
+            # flow (pixels) -> angular displacement (rad) over dt_flow
+            dalpha = flow_h * (hfov_rad / flow_H)
+            delev = flow_v * (vfov_span_rad / flow_W)
+
+            alpha_dot = dalpha / dt_flow
+            elev_dot = delev / dt_flow
+
+            # reshape rays to [N,H,W,3]
+            e_r = ray_dir_flat.reshape(lidar_scan_dis.shape[0], *self.lidar_resolution, 3)
+
+            # compute alpha/elev from e_r
+            x = e_r[..., 0]
+            y = e_r[..., 1]
+            z = torch.clamp(e_r[..., 2], -1.0, 1.0)
+
+            alpha = torch.atan2(y, x)
+            elev = torch.asin(z)
+
+            sa = torch.sin(alpha)
+            ca = torch.cos(alpha)
+            se = torch.sin(elev)
+            ce = torch.cos(elev)
+
+            # tangential bases
+            e_alpha = torch.stack([-sa, ca, torch.zeros_like(sa)], dim=-1)
+            e_elev = torch.stack([-se * ca, -se * sa, ce], dim=-1)
+
+            # range rate (m/s)
+            r_s = r.squeeze(1)
+            drdt = (-closing_raw.squeeze(1)).float()  # approaching -> negative
+
+            # tangential relative velocity (m/s)
+            vt = r_s.unsqueeze(-1) * ((ce * alpha_dot).unsqueeze(-1) * e_alpha + (elev_dot).unsqueeze(-1) * e_elev)
+
+            # relative velocity vector (m/s)
+            v_rel = drdt.unsqueeze(-1) * e_r + vt
+
+            # CPA
+            r_vec = r_s.unsqueeze(-1) * e_r
+            v2 = (v_rel * v_rel).sum(dim=-1)
+            v2 = torch.clamp(v2, min=1.0e-6)
+
+            t_star = - (r_vec * v_rel).sum(dim=-1) / v2
+            t_star = torch.clamp(t_star, 0.0, T_h)
+
+            d_cpa = (r_vec + v_rel * t_star.unsqueeze(-1)).norm(dim=-1)
+
+            # hazard in [0,1]
+            s_dist_eff = max(s_dist, 1.0e-3)
+            s_time_eff = max(s_time, 1.0e-3)
+            H_cpa = torch.sigmoid((R_safe - d_cpa) / s_dist_eff) * torch.sigmoid((t_star - t_min) / s_time_eff)
+            H_cpa = H_cpa.unsqueeze(1)
+
+            # confidence weight w in [0,1]
+            vt_mag = vt.norm(dim=-1)
+            w_v = torch.sigmoid(k_v * (vt_mag - vt_min))
+            w_r = torch.sigmoid(k_r * (r_max - r_s))
+            w = w_v * w_r
+
+            # apply a floor only when tangential motion is present (CPA-dominant for crossing cases)
+            w = torch.where(vt_mag > w_floor_vt, w_floor + (1.0 - w_floor) * w, w)
+
+            # numerical stability: if relative speed is too small, do not trust CPA
+            w = torch.where(v2 > v2_min, w, torch.zeros_like(w))
+            w = w.unsqueeze(1)
+
+            # blend hazards
+            H = (1.0 - w) * H_ttc + w * H_cpa
+
+            # keep the same far-mask
+            H = torch.where(mask, H, torch.zeros_like(H))
+
+        # -------------------------
+        # masked-softmax aggregation to scalar risk
+        # -------------------------
         H_flat = H.view(H.shape[0], -1)
         mask_flat = mask.view(mask.shape[0], -1)
 
@@ -1886,106 +2365,3 @@ class Env(IsaacEnv):
 
         risk_smax = (pi * H_flat).sum(dim=-1)
         return risk_smax
-
-    def _compute_safety_reward(self, lidar_scan: torch.Tensor) -> torch.Tensor:
-        """Safety reward (P2M legacy logic).
-
-        Input lidar_scan uses proximity convention: lidar_range - distance (meters),
-        typically shaped [N,1,H,W]. This method is intentionally kept identical to
-        the oldest P2M implementation to avoid changing reward behavior.
-        """
-        # Accept [N,H,W] or [N,C,H,W]; use channel0 if multi-channel
-        if lidar_scan.ndim == 3:
-            lidar_scan = lidar_scan.unsqueeze(1)
-        elif lidar_scan.ndim == 4 and lidar_scan.size(1) != 1:
-            lidar_scan = lidar_scan[:, :1, ...]
-
-        # proximity -> distance
-        lidar_values = self.lidar_range - lidar_scan
-        lidar_values_merged = lidar_values.reshape(
-            lidar_values.size(0), lidar_values.size(1), -1
-        ).squeeze(1)  # [N, H*W]
-
-        lidar_values_clip = torch.clamp(lidar_values_merged - self.safety_dis, min=0.0)
-
-        obs_mask = lidar_values_merged <= (self.lidar_range / 10.0)
-        obs_count = obs_mask.sum(dim=1)
-        obs_dist_avg = (lidar_values_clip * obs_mask).sum(dim=1) / (obs_count + 1e-9)
-
-        obs_dist_min = lidar_values_clip.min(dim=1)[0]
-        obs_dist = torch.where(obs_count != 0, obs_dist_avg, obs_dist_min)
-
-        reward_safety = torch.log(obs_dist).clamp_min(-5.0)
-        # Optional: cap positive safety reward (set safety_reward_max=0.0 to make it penalty-only)
-        safety_r_max = self.cfg.task.get("safety_reward_max", None)
-        if safety_r_max is not None:
-            reward_safety = reward_safety.clamp_max(float(safety_r_max))
-        return reward_safety.reshape(-1, 1)
-    def _compute_dobs_reward(self, obstacle_tensor, drone_pos, drone_vel):
-        # NOTE: obstacle_tensor may be None/empty when dynamic obstacles are disabled
-        # (e.g., curriculum sets dynamic_obs_active=0). In that case, return 0 reward.
-        if obstacle_tensor is None or (hasattr(obstacle_tensor, "numel") and obstacle_tensor.numel() == 0):
-            num_env = drone_pos.shape[0]
-            return torch.zeros((num_env, 1), device=self.device)
-
-        num_env = drone_pos.shape[0]
-        n = obstacle_tensor.shape[0]
-        if n == 0:
-            # dynamic_obs_num=0 safety: no dynamic obstacles => no dobs reward/penalty
-            return torch.zeros((num_env, 1), device=self.device)
-        pos = obstacle_tensor[:, 0]
-        vel = obstacle_tensor[:, 1]
-        rad = obstacle_tensor[:, 2, 0]
-
-        drone_pos_expanded = drone_pos.unsqueeze(1).expand(num_env, n, 2)
-        drone_vel_expanded = drone_vel.unsqueeze(1).expand(num_env, n, 2)
-        pos_expanded = pos.unsqueeze(0).expand(num_env, n, 2)
-
-        obstacle_vel_drone_frame = vel - drone_vel_expanded
-        if self.reward_dobs_max is None:
-            self.reward_dobs_max = torch.full((num_env, 1), float("-inf"), device=self.device)
-
-        r = pos - drone_pos_expanded
-        dot_product = (r * obstacle_vel_drone_frame).sum(dim=2)
-        r_norm = r.norm(dim=2)
-        v_norm = obstacle_vel_drone_frame.norm(dim=2)
-
-        cos_theta = dot_product / (r_norm * v_norm)
-        cos_theta = cos_theta.clamp(-1.0, 1.0)
-        theta = torch.acos(cos_theta)
-        coll_mask = theta < (torch.pi / 2)
-
-        vel_magnitude = torch.norm(vel, dim=1)
-        dist = torch.norm(pos_expanded - drone_pos_expanded, dim=2) - rad
-
-        unit_velocity = vel / (vel_magnitude.unsqueeze(1) + 1e-6)
-        unit_velocity_expanded = unit_velocity.unsqueeze(0).expand(num_env, n, 2)
-
-        v_x = unit_velocity_expanded[..., 0]
-        v_y = unit_velocity_expanded[..., 1]
-        x = pos_expanded[..., 0]
-        y = pos_expanded[..., 1]
-        x_d = drone_pos_expanded[..., 0]
-        y_d = drone_pos_expanded[..., 1]
-
-        speed_line_distance = torch.abs((x_d - x) * v_y - (y_d - y) * v_x)
-        fov_mask = dist <= (self.lidar_range * 0.75)
-        obs_count = fov_mask.sum(dim=1).clamp(min=1)
-
-        k_v = torch.norm(obstacle_vel_drone_frame, dim=2)
-        k_theta = 1.0 - (2 * theta / torch.pi)
-        k_d = torch.exp(1.0 / (1.0 + speed_line_distance))
-        k_total = torch.where(
-            coll_mask != 0,
-            1 + k_v * k_theta * k_d,
-            torch.ones_like(theta),
-        )
-
-        r_d_zoom = (dist - self.safety_dis).clamp_min(0.0) / (k_total + 1e-6)
-        r_d = torch.log(r_d_zoom).clamp_min(-5.0)
-
-        reward_dobs = ((r_d * fov_mask).sum(dim=1) / obs_count).reshape(num_env, 1)
-        self.reward_dobs_max = torch.max(self.reward_dobs_max, reward_dobs)
-        reward_dobs = torch.where(reward_dobs == 0, self.reward_dobs_max, reward_dobs)
-
-        return reward_dobs

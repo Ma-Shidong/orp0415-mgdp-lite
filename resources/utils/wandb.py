@@ -28,30 +28,19 @@ import os
 import wandb
 from omegaconf import OmegaConf
 
-
-def dict_flatten(a: dict, delim="."):
-    """Flatten a dict recursively.
-    Examples:
-        >>> a = {
-                "a": 1,
-                "b":{
-                    "c": 3,
-                    "d": 4,
-                    "e": {
-                        "f": 5
-                    }
-                }
-            }
-        >>> dict_flatten(a)
-        {'a': 1, 'b.c': 3, 'b.d': 4, 'b.e.f': 5}
-    """
-    result = {}
-    for k, v in a.items():
-        if isinstance(v, dict):
-            result.update({k + delim + kk: vv for kk, vv in dict_flatten(v).items()})
-        else:
-            result[k] = v
-    return result
+def dict_flatten(x, parent_key="", sep="."):
+    items = {}
+    if isinstance(x, dict):
+        for k, v in x.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
+            items.update(dict_flatten(v, new_key, sep=sep))
+    elif isinstance(x, (list, tuple)):
+        for i, v in enumerate(x):
+            new_key = f"{parent_key}{sep}{i}" if parent_key else str(i)
+            items.update(dict_flatten(v, new_key, sep=sep))
+    else:
+        items[parent_key] = x
+    return items
 
 
 def init_wandb(cfg):

@@ -24,12 +24,13 @@ import torch
 import numpy as np
 import einops
 from tqdm import tqdm
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Any, Dict
 
 from dataclasses import dataclass
 from torchrl.envs import EnvBase
 from torchrl.data import TensorSpec, CompositeSpec
 from tensordict import TensorDictBase
+
 
 
 @dataclass
@@ -151,3 +152,53 @@ class EpisodeStats:
     def __len__(self):
         return len(self._stats)
 
+def create_env(cfg, headless: bool = True):
+    """
+    Create TorchRL env with ORP env registry.
+    This is used by some framework wrappers.
+    """
+    from resources.envs.isaac_env import IsaacEnv
+    from resources.utils.torchrl.transforms import wrap_env
+
+    if cfg.task.name not in IsaacEnv.REGISTRY:
+        raise KeyError(
+            f"[create_env] Unknown task name: {cfg.task.name}. "
+            f"Available: {list(IsaacEnv.REGISTRY.keys())}"
+        )
+
+    env_class = IsaacEnv.REGISTRY[cfg.task.name]
+    base_env = env_class(cfg, headless=headless)
+    env = wrap_env(base_env)
+    return env
+
+
+def check_env(env) -> None:
+    """
+    Basic sanity checks for TorchRL env specs.
+    """
+    # TorchRL env has input_spec / output_spec; not all wrappers expose both.
+    if hasattr(env, "observation_spec"):
+        _ = env.observation_spec
+    if hasattr(env, "action_spec"):
+        _ = env.action_spec
+    if hasattr(env, "reward_spec"):
+        _ = env.reward_spec
+
+    # One step dry-run (safe guard)
+    try:
+        td = env.reset()
+        a = env.action_spec.zero()
+        td["agents", "action"] = a if ("agents", "action") in td.keys(True, True) else a
+        env.step(td)
+    except Exception as e:
+        raise RuntimeError(f"[check_env] env dry-run failed: {e}") from e
+
+
+def update_policy_weights_(policy: torch.nn.Module, state_dict: Dict[str, Any], strict: bool = False) -> None:
+    """
+    Load weights into policy/actor/critic.
+    Framework may call this hook.
+    """
+    missing, unexpected = policy.load_state_dict(state_dict, strict=strict)
+    if missing or unexpected:
+        print(f"[update_policy_weights_] missing={missing}, unexpected={unexpected}")

@@ -35,6 +35,12 @@ from tensordict.nn import TensorDictSequential, TensorDictModule, TensorDictModu
 from torchrl.envs.transforms import CatTensors
 from torchrl.modules import ProbabilisticActor
 
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+
+# Use TF32 on Ampere+ for faster matmul with minimal accuracy impact.
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
 
 class PPOPolicy(TensorDictModuleBase):
 
@@ -43,11 +49,11 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.001
-        self.clip_param = 0.1
+        self.entropy_coef = 0.03 # 熵正则系数，鼓励策略保持随机性（探索），避免过早“变得很确定”
+        self.clip_param = 0.25 # 限制策略更新幅度，越大越敢于更新
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
-        self.gae = GAE(0.99, 0.95)
+        self.gae = GAE(0.995, 0.95)
 
         fake_input = observation_spec.zero()
 
@@ -89,10 +95,14 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.actor.apply(init_)
         self.critic.apply(init_)
-
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=5e-4)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
+        # 学习率
+        # self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=3e-4)
+        # self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
+        # self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
+        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=1e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=2e-4)
+        
         self.value_norm = ValueNorm1(1).to(self.device)
 
     def __call__(self, tensordict: TensorDict):
@@ -178,6 +188,125 @@ class PPOPolicy(TensorDictModuleBase):
         }, [])
 
 
+@dataclass
+class CurriculumLevel:
+    name: str
+    success_ge: float
+    static_obs_num_total: int = 0
+    static_obs_platform_width: float = 0.0
+    dynamic_obs_active: int = 0
+
+
+class SuccessCurriculum:
+    def __init__(self, cfg: Dict[str, Any]):
+        self.enable = bool(cfg.get("enable", False))
+        self.metric = cfg.get("metric", "done_success")  # ✅ done_success
+        self.ema_alpha = float(cfg.get("ema_alpha", 0.05))
+        self.check_every_iters = int(cfg.get("check_every_iters", 100))  # ✅ 100 iter
+        self.patience = int(cfg.get("patience", 3))
+        self.cooldown = int(cfg.get("cooldown", 0))
+        self.monotonic = bool(cfg.get("monotonic", True))
+        self.reset_ema_on_switch = bool(cfg.get("reset_ema_on_switch", True))
+
+        self.levels: List[CurriculumLevel] = []
+        for lv in cfg.get("levels", []):
+            self.levels.append(
+                CurriculumLevel(
+                    name=str(lv.get("name", f"L{len(self.levels)}")),
+                    success_ge=float(lv.get("success_ge", 0.0)),
+                    static_obs_num_total=int(
+                        lv.get(
+                            "static_obs_num_total",
+                            lv.get("static_obs_num_per_grid", lv.get("static_obs_num_per_gird", 0)),
+                        )
+                    ),
+                    static_obs_platform_width=float(lv.get("static_obs_platform_width", 0.0)),
+                    dynamic_obs_active=int(lv.get("dynamic_obs_active", 0)),
+                )
+            )
+
+        self.level = int(cfg.get("start_level", 0))
+        self.ema_success = 0.0
+        self._pat = 0
+        self._cool = 0
+        self._last_switch_iter = -10**9
+        self._last_check_idx = -1
+
+    def maybe_update(self, it: int, success_raw: float) -> Dict[str, float]:
+        enabled = bool(self.enable and len(self.levels) > 0)
+        next_level = self.level + 1
+        has_next = next_level < len(self.levels)
+        threshold = self.levels[next_level].success_ge if has_next else -1.0
+        check_idx = -1
+        if enabled and self.check_every_iters > 0:
+            check_idx = int(it) // int(self.check_every_iters)
+        checks_passed = max(0, check_idx - self._last_check_idx)
+        check_hit = checks_passed > 0
+        out = {
+            "curriculum/ema_success": self.ema_success,
+            "curriculum/level": float(self.level),
+            "curriculum/switch": 0.0,
+            "curriculum/raw_success": float(success_raw),
+            "curriculum/enabled": 1.0 if enabled else 0.0,
+            "curriculum/check": 1.0 if check_hit else 0.0,
+            "curriculum/check_idx": float(check_idx),
+            "curriculum/checks_passed": float(checks_passed),
+            "curriculum/check_every_iters": float(self.check_every_iters),
+            "curriculum/patience": float(self.patience),
+            "curriculum/cooldown_left": float(self._cool),
+            "curriculum/threshold": float(threshold),
+            "curriculum/patience_count": float(self._pat),
+        }
+        if not enabled:
+            return out
+
+        # EMA update
+        if self.ema_success == 0.0:
+            self.ema_success = float(success_raw)
+        else:
+            self.ema_success = (1.0 - self.ema_alpha) * self.ema_success + self.ema_alpha * float(success_raw)
+        out["curriculum/ema_success"] = self.ema_success
+
+        if not check_hit:
+            return out
+        self._last_check_idx = check_idx
+
+        # cooldown
+        if self._cool > 0:
+            self._cool = max(0, self._cool - checks_passed)
+            out["curriculum/cooldown_left"] = float(self._cool)
+            if self._cool > 0:
+                return out
+
+        # decide next level threshold (use NEXT level's success_ge)
+        if not has_next:
+            out["curriculum/ema_success"] = self.ema_success
+            return out
+
+        threshold = self.levels[next_level].success_ge
+        if self.ema_success >= threshold:
+            self._pat += checks_passed
+        else:
+            self._pat = 0
+        out["curriculum/patience_count"] = float(self._pat)
+
+        if self._pat >= self.patience:
+            # switch!
+            self.level = next_level
+            self._pat = 0
+            self._cool = self.cooldown
+            out["curriculum/switch"] = 1.0
+            out["curriculum/level"] = float(self.level)
+            out["curriculum/patience_count"] = float(self._pat)
+            out["curriculum/cooldown_left"] = float(self._cool)
+
+            if self.reset_ema_on_switch:
+                self.ema_success = 0.0
+            out["curriculum/ema_success"] = self.ema_success
+
+        return out
+
+
 @hydra.main(version_base=None, config_path="config", config_name="train")
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
@@ -193,6 +322,12 @@ def main(cfg):
 
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
     base_env = env_class(cfg, headless=cfg.headless)
+
+    # curriculum manager
+    curr_cfg = {}
+    if hasattr(cfg.task, "success_curriculum"):
+        curr_cfg = OmegaConf.to_container(cfg.task.success_curriculum, resolve=True)
+    curr_mgr = SuccessCurriculum(curr_cfg)
 
     transforms = [InitTracker()]
 
@@ -251,6 +386,7 @@ def main(cfg):
         )
     eval_interval = cfg.get("eval_interval", -1)
     save_interval = cfg.get("save_interval", -1)
+    record_video = bool(cfg.get("record_video", True))
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -268,9 +404,10 @@ def main(cfg):
 
     @torch.no_grad()
     def evaluate(
-        seed: int=0,
+        seed: int = 0,
         render_video: bool = False,
-        exploration_type: ExplorationType=ExplorationType.MODE
+        exploration_type: ExplorationType = ExplorationType.MODE,
+        prefix: str = "eval",
     ):
 
         base_env.enable_render(True)
@@ -283,34 +420,45 @@ def main(cfg):
         if render_video:
             render_callback = RenderCallback(interval=2)
 
+        # Streamed eval to avoid storing full rollouts on GPU.
+        stats_keys = [
+            k for k in base_env.observation_spec.keys(True, True)
+            if isinstance(k, tuple) and k[0] == "stats"
+        ]
+        episode_stats = EpisodeStats(stats_keys)
+        td = env.reset()
+
         with set_exploration_type(exploration_type):
-            trajs = env.rollout(
-                max_steps=base_env.max_episode_length,
-                policy=policy,
-                callback=render_callback,
-                auto_reset=True,
-                break_when_any_done=False,
-                return_contiguous=False,
-            )
+            for _ in range(base_env.max_episode_length):
+                if render_video and render_callback:
+                    render_callback(env)
+                td = policy(td)
+                td = env.step(td)
+                episode_stats.add(td)
+                # advance to next step
+                td = td["next"]
+                if len(episode_stats) >= env.num_envs:
+                    break
+
         base_env.enable_render(not cfg.headless)
         env.reset()
 
-        done = trajs.get(("next", "done"))
-        first_done = torch.argmax(done.long(), dim=1).cpu()
+        traj_stats = episode_stats.pop()
+        # NOTE: EpisodeStats.pop() returns a TensorDict that may contain nested
+        # TensorDict values (e.g., {"stats": TensorDict(...)}). Using
+        # `.items(True, True)` flattens it into leaf tensors, consistent with
+        # the training logger below.
+        traj_stats = traj_stats.cpu()
+        stats_mean = {k: v.float().mean().item() for k, v in traj_stats.items(True, True)}
 
-        def take_first_episode(tensor: torch.Tensor):
-            indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-            return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-        traj_stats = {
-            k: take_first_episode(v)
-            for k, v in trajs[("next", "stats")].cpu().items()
-        }
-
-        info = {
-            "eval/stats." + k: torch.mean(v.float()).item()
-            for k, v in traj_stats.items()
-        }
+        info = {}
+        for k, v in stats_mean.items():
+            # k is usually a tuple like ("stats", "done_success")
+            if isinstance(k, tuple):
+                key_str = ".".join(map(str, k))
+            else:
+                key_str = str(k)
+            info[f"{prefix}/{key_str}"] = float(v)
 
         if render_video and render_callback:
             # log video
@@ -333,18 +481,59 @@ def main(cfg):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
         episode_stats.add(data.to_tensordict())
 
-        if len(episode_stats) >= base_env.num_envs:
-            stats = {
-                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
-                for k, v in episode_stats.pop().items(True, True)
+        if len(episode_stats) >= cfg.task.env.num_envs:
+            info = {
+                "iter": i,
+                "env_frames": collector._frames,
+                "frames_per_batch": frames_per_batch,
+                "rollout_fps": collector._fps,
+                "train/episode_samples": len(episode_stats),
             }
-            info.update(stats)
+
+            stats_td = episode_stats.pop()
+            stats_mean = {k: v.mean().item() for k, v in stats_td.items(True, True)}
+
+            # ✅ success_raw from done_success
+            metric = str(getattr(curr_mgr, "metric", "done_success") or "done_success")
+            if metric.startswith("stats."):
+                metric = metric.split("stats.", 1)[1]
+            success_raw = float(
+                stats_mean.get(("stats", metric), stats_mean.get(("stats", "done_success"), 0.0))
+            )
+
+            # curriculum update + log curves
+            cinfo = curr_mgr.maybe_update(i, success_raw)
+            info.update(cinfo)
+
+            # ✅ if switched, request level + reset to apply immediately
+            if cinfo.get("curriculum/switch", 0.0) > 0.5:
+                try:
+                    base_env.request_curriculum_level(curr_mgr.level)
+                    env.reset()  # apply now
+                except Exception as e:
+                    print(f"[Curriculum] switch failed: {e}")
+
+            # log stats (filter duplicates)
+            for k, v in stats_mean.items():
+                key_str = ".".join(k)
+                # 过滤 done_ratio_*（和 done_*重复）
+                if key_str.startswith("stats.done_ratio_"):
+                    continue
+                info[f"train/{key_str}"] = v
 
         info.update(policy.train_op(data.to_tensordict()))
 
         if eval_interval > 0 and i % eval_interval == 0 and i != 0:
             logging.info(f"Eval at {collector._frames} steps.") 
-            info.update(evaluate(render_video=False))
+            try:
+                # Eval with deterministic action selection (distribution mode / mean)
+                info.update(evaluate(render_video=False, exploration_type=ExplorationType.MODE, prefix="eval_mode"))
+                # Eval with stochastic action sampling (helps detect multi-modal policies)
+                _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
+                if _sample_expl is not None:
+                    info.update(evaluate(render_video=False, exploration_type=_sample_expl, prefix="eval_sample"))
+            except Exception as e:
+                logging.exception(f"Eval failed (skipping this eval): {e}")
             env.train()
             base_env.train()
 
@@ -356,8 +545,24 @@ def main(cfg):
             except AttributeError:
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
             
-            logging.info(f"Eval and render video at {collector._frames} steps.")
-            info.update(evaluate(render_video=True))
+            if record_video:
+                logging.info(f"Eval and render video at {collector._frames} steps.")
+                try:
+                    info.update(evaluate(render_video=True, exploration_type=ExplorationType.MODE, prefix="eval_mode"))
+                    _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
+                    if _sample_expl is not None:
+                        info.update(evaluate(render_video=False, exploration_type=_sample_expl, prefix="eval_sample"))
+                except Exception as e:
+                    logging.exception(f"Video eval failed (skipping video): {e}")
+            else:
+                logging.info(f"Eval at {collector._frames} steps (video disabled).")
+                try:
+                    info.update(evaluate(render_video=False, exploration_type=ExplorationType.MODE, prefix="eval_mode"))
+                    _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
+                    if _sample_expl is not None:
+                        info.update(evaluate(render_video=False, exploration_type=_sample_expl, prefix="eval_sample"))
+                except Exception as e:
+                    logging.exception(f"Eval failed (skipping this eval): {e}")
 
         run.log(info)
         print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
@@ -367,7 +572,13 @@ def main(cfg):
 
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}
-    info.update(evaluate())
+    try:
+        info.update(evaluate(exploration_type=ExplorationType.MODE, prefix="eval_mode"))
+        _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
+        if _sample_expl is not None:
+            info.update(evaluate(exploration_type=_sample_expl, prefix="eval_sample"))
+    except Exception as e:
+        logging.exception(f"Final eval failed: {e}")
     run.log(info)
 
     try:
