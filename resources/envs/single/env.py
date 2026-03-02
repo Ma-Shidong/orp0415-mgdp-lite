@@ -76,6 +76,8 @@ class Env(IsaacEnv):
         self.actions = None
         self.last_dis2goal = None
         self.last_acc = None
+        self.last_risk_smax = None
+        self.last_risk_valid = None
         # Per-env validity mask for jerk baseline. We want to avoid penalizing jerk across episode
         # boundaries for envs that have just been reset.
         self.last_acc_valid = None
@@ -142,8 +144,22 @@ class Env(IsaacEnv):
         rot = euler_to_quaternion(torch.tensor([0.0, 0.1, 0.1]))
         light.spawn.func(light.prim_path, light.spawn, light.init_state.pos, rot)
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
-        
-        self.seed = 10
+
+        # Seed (allow cfg override; -1 => random)
+        seed_cfg = self.cfg.task.get("seed", 10)
+        try:
+            seed_cfg = int(seed_cfg)
+        except Exception:
+            seed_cfg = 10
+        if seed_cfg < 0:
+            seed_cfg = int(torch.randint(0, 2**31 - 1, (1,), device="cpu").item())
+        self.seed = int(seed_cfg)
+        self._rng = torch.Generator(device=self.device)
+        self._rng.manual_seed(self.seed)
+
+        # Base start/goal positions (for domain randomization jitter)
+        self._start_pos_base = None
+        self._target_pos_base = None
 
         # ---------------------------------------------------------------------
         # Static obstacles / terrain sizing
@@ -580,11 +596,11 @@ class Env(IsaacEnv):
             "reward_height": UnboundedContinuousTensorSpec(1),
             "reward_goal": UnboundedContinuousTensorSpec(1),
             "reward_risk": UnboundedContinuousTensorSpec(1),
+            "reward_risk_delta": UnboundedContinuousTensorSpec(1),
             "reward_collision": UnboundedContinuousTensorSpec(1),
+            "reward_bound": UnboundedContinuousTensorSpec(1),
             "risk_smax": UnboundedContinuousTensorSpec(1),
             "goal_gate": UnboundedContinuousTensorSpec(1),
-            # Temporal observation diagnostics (debug / sanity-check)
-            "temporal_reset_rate": UnboundedContinuousTensorSpec(1),
             "radial_valid_ratio": UnboundedContinuousTensorSpec(1),
             "radial_abs_mean": UnboundedContinuousTensorSpec(1),
             "flow_abs_mean": UnboundedContinuousTensorSpec(1),
@@ -697,6 +713,22 @@ class Env(IsaacEnv):
             self._dobs_active_num = int(getattr(self, "dynamic_obs_num", 0))
         self._dobs_active_num = max(0, min(int(self._dobs_active_num), int(getattr(self, "dynamic_obs_num", 0))))
         active = int(self._dobs_active_num)
+
+        # Optional per-level dynamic obstacle speed range (supports curriculum).
+        # If provided in success_curriculum.levels[*].dobs_vel_range: [vmin, vmax]
+        try:
+            cfg = self._success_curriculum_levels[level]
+            vel_rng = _level_cfg_get(cfg, "dobs_vel_range", None)
+            if vel_rng is None:
+                vel_rng = _level_cfg_get(cfg, "dynamic_obs_vel_range", None)
+            if vel_rng is not None and len(vel_rng) >= 2:
+                v0 = float(vel_rng[0])
+                v1 = float(vel_rng[1])
+                if v1 < v0:
+                    v0, v1 = v1, v0
+                self.dobs_vel_range = (v0, v1)
+        except Exception:
+            pass
 
         # If we just activated new dynamic obstacles (e.g., L0->L2), restore their
         # positions/velocities from the parked state so they become visible again.
@@ -870,6 +902,111 @@ class Env(IsaacEnv):
             self.target_pos[3*drones_per_side:, 0, 1] = - out_max/2 + offset
             self.target_pos[:, 0, 2] = self.fly_height
 
+        # -------------------------
+        # Domain randomization: start/goal jitter
+        # -------------------------
+        rand_cfg = self.cfg.task.get("domain_rand", {})
+        rand_on = bool(rand_cfg.get("enable", False))
+        if rand_on:
+            if self._start_pos_base is None:
+                self._start_pos_base = self.start_pos.clone()
+            if self._target_pos_base is None:
+                self._target_pos_base = self.target_pos.clone()
+
+            j_start_xy = float(rand_cfg.get("start_pos_xy_jitter", 0.0))
+            j_goal_xy = float(rand_cfg.get("goal_pos_xy_jitter", 0.0))
+            j_start_z = float(rand_cfg.get("start_pos_z_jitter", 0.0))
+            j_goal_z = float(rand_cfg.get("goal_pos_z_jitter", 0.0))
+
+            if j_start_xy > 0.0:
+                delta = (torch.rand((len(env_ids), 1, 2), device=self.device, generator=self._rng) * 2.0 - 1.0) * j_start_xy
+                self.start_pos[env_ids, 0, :2] = self._start_pos_base[env_ids, 0, :2] + delta.squeeze(1)
+            else:
+                self.start_pos[env_ids, 0, :2] = self._start_pos_base[env_ids, 0, :2]
+
+            if j_goal_xy > 0.0:
+                delta = (torch.rand((len(env_ids), 1, 2), device=self.device, generator=self._rng) * 2.0 - 1.0) * j_goal_xy
+                self.target_pos[env_ids, 0, :2] = self._target_pos_base[env_ids, 0, :2] + delta.squeeze(1)
+            else:
+                self.target_pos[env_ids, 0, :2] = self._target_pos_base[env_ids, 0, :2]
+
+            if j_start_z > 0.0:
+                dz = (torch.rand((len(env_ids), 1), device=self.device, generator=self._rng) * 2.0 - 1.0) * j_start_z
+                self.start_pos[env_ids, 0, 2] = self._start_pos_base[env_ids, 0, 2] + dz.squeeze(1)
+            else:
+                self.start_pos[env_ids, 0, 2] = self._start_pos_base[env_ids, 0, 2]
+
+            if j_goal_z > 0.0:
+                dz = (torch.rand((len(env_ids), 1), device=self.device, generator=self._rng) * 2.0 - 1.0) * j_goal_z
+                self.target_pos[env_ids, 0, 2] = self._target_pos_base[env_ids, 0, 2] + dz.squeeze(1)
+            else:
+                self.target_pos[env_ids, 0, 2] = self._target_pos_base[env_ids, 0, 2]
+
+            # Dynamic obstacle randomization (positions/velocities) without changing count.
+            # NOTE: Obstacles are global across envs; only randomize on full reset unless configured otherwise.
+            if bool(rand_cfg.get("dobs_randomize", True)):
+                global_only = bool(rand_cfg.get("dobs_randomize_global_reset_only", True))
+                if (not global_only) or (int(env_ids.numel()) == int(self.num_envs)):
+                    active = int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))
+                    active = max(0, min(active, int(getattr(self, "dynamic_obs_num", 0))))
+                    if active > 0 and (self.dobs_states is not None) and (self.dobs_states.shape[0] >= active):
+                        # Per-level velocity range (fallback to global).
+                        vel_rng = self.dobs_vel_range
+                        if getattr(self, "_curriculum_enabled", False) and len(getattr(self, "_success_curriculum_levels", [])) > 0:
+                            try:
+                                level_cfg = self._success_curriculum_levels[int(getattr(self, "_curriculum_level", 0))]
+                            except Exception:
+                                level_cfg = None
+                            def _level_cfg_get(level_cfg, key, default):
+                                if level_cfg is None:
+                                    return default
+                                getter = getattr(level_cfg, "get", None)
+                                if getter is None:
+                                    return default
+                                try:
+                                    return getter(key, default)
+                                except Exception:
+                                    return default
+                            vel_rng = _level_cfg_get(level_cfg, "dobs_vel_range", vel_rng)
+
+                        v0, v1 = float(vel_rng[0]), float(vel_rng[1])
+                        x0, x1 = float(self.dobs_pos_x_range[0]), float(self.dobs_pos_x_range[1])
+                        y0, y1 = float(self.dobs_pos_y_range[0]), float(self.dobs_pos_y_range[1])
+
+                        rx = torch.rand((active,), device=self.device, generator=self._rng)
+                        ry = torch.rand((active,), device=self.device, generator=self._rng)
+                        pos_xy = torch.stack([x0 + (x1 - x0) * rx, y0 + (y1 - y0) * ry], dim=-1)
+                        self.dobs_states[:active, 0] = pos_xy
+                        if self.dobs_origins is not None and self.dobs_origins.shape[0] >= active:
+                            self.dobs_origins[:active] = pos_xy
+
+                        rv = torch.rand((active,), device=self.device, generator=self._rng)
+                        ra = torch.rand((active,), device=self.device, generator=self._rng)
+                        vel_norm = v0 + (v1 - v0) * rv
+                        vel_ang = 2.0 * math.pi * ra
+                        vel_xy = torch.stack([vel_norm * torch.cos(vel_ang), vel_norm * torch.sin(vel_ang)], dim=-1)
+                        self.dobs_states[:active, 1] = vel_xy
+
+                        # Park inactive obstacles far away
+                        if active < int(getattr(self, "dynamic_obs_num", 0)):
+                            self.dobs_states[active:, 0, 0] = 1.0e6
+                            self.dobs_states[active:, 0, 1] = 1.0e6
+                            self.dobs_states[active:, 1].zero_()
+
+                        if getattr(self, "set_dobs_state", None) is not None:
+                            if self.set_dobs_state.ndim == 3:
+                                self.set_dobs_state[:, :active, :2] = pos_xy.unsqueeze(0)
+                                self.set_dobs_state[:, :active, 2] = self.dobs_height / 2
+                                if active < int(getattr(self, "dynamic_obs_num", 0)):
+                                    self.set_dobs_state[:, active:, :2] = 1.0e6
+                                    self.set_dobs_state[:, active:, 2] = self.dobs_height / 2
+                            else:
+                                self.set_dobs_state[:active, :2] = pos_xy
+                                self.set_dobs_state[:active, 2] = self.dobs_height / 2
+                                if active < int(getattr(self, "dynamic_obs_num", 0)):
+                                    self.set_dobs_state[active:, :2] = 1.0e6
+                                    self.set_dobs_state[active:, 2] = self.dobs_height / 2
+
         pos = self.start_pos[env_ids]
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
         rot = euler_to_quaternion(rpy)
@@ -952,6 +1089,14 @@ class Env(IsaacEnv):
         else:
             self.last_acc_valid = self.last_acc_valid.view(-1)
         self.last_acc_valid[env_ids] = False
+
+        # Mark risk baseline invalid for just-reset envs so we don't reward/penalize
+        # risk deltas across episode boundaries.
+        if self.last_risk_valid is None:
+            self.last_risk_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        else:
+            self.last_risk_valid = self.last_risk_valid.view(-1)
+        self.last_risk_valid[env_ids] = False
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         # defensive: ensure acc_min exists (older configs / patches)
@@ -1489,14 +1634,6 @@ class Env(IsaacEnv):
             flow_flat = flow_zoom.view(self.num_envs, -1)
             self.flow_abs_mean = flow_flat.abs().mean(dim=1, keepdim=True)
 
-            if temporal_reset_ids is not None:
-                reset_rate = float(temporal_reset_ids.numel()) / float(self.num_envs)
-            else:
-                reset_rate = 0.0
-            self.temporal_reset_rate = torch.full(
-                (self.num_envs, 1), reset_rate, device=self.device, dtype=torch.float32
-            )
-
         # Clear per-env temporal reset flags once we've patched the histories for this step.
         if temporal_reset_ids is not None and (self._temporal_reset_mask is not None):
             self._temporal_reset_mask[temporal_reset_ids] = False
@@ -1635,7 +1772,16 @@ class Env(IsaacEnv):
         # -------------------------
         # state reward components (energy + jerk + height)
         # -------------------------
-        vel_limit = 1.2 * self.vel_max
+        # Soft speed/acc limits for termination/penalty checks.
+        # vel_limit_factor lets you tighten the overspeed window without changing vel_max.
+        try:
+            vel_limit_factor = float(self.cfg.task.get("vel_limit_factor", 1.2))
+        except Exception:
+            vel_limit_factor = 1.2
+        # keep it sane
+        vel_limit_factor = max(1.0, float(vel_limit_factor))
+        vel_limit = vel_limit_factor * self.vel_max
+
         acc_limit = 1.5 * self.acc_max
 
         height_ref = float(self.cfg.task.get("height_ref", self.fly_height))
@@ -1645,32 +1791,7 @@ class Env(IsaacEnv):
         )
 
         # -------------------------
-        # speed reward (cruise speed shaping)
-        # R_v = exp(-((||v|| - v_ref)^2) / sigma_v^2)
-        # -------------------------
-        try:
-            v_ref = float(self.cfg.task.get("v_ref", self.cfg.task.get("speed_ref", (self.vel_min + self.vel_max) * 0.5)))
-        except Exception:
-            v_ref = float((self.vel_min + self.vel_max) * 0.5)
-        try:
-            sigma_v = float(self.cfg.task.get("sigma_v", self.cfg.task.get("speed_sigma", max(0.5, 0.2 * float(self.vel_max)))))
-        except Exception:
-            sigma_v = max(0.5, 0.2 * float(self.vel_max))
-        sigma_v = float(max(sigma_v, 1.0e-3))
-        reward_vel = torch.exp(-((vel_magnitude - v_ref) ** 2) / (sigma_v ** 2 + 1.0e-6)).view(-1, 1)
-
-        # goal reward (ungated)
-        # goal reward (ungated)
-        # Use planar velocity/direction when goal_use_planar is enabled, so vertical maneuvers
-        # (e.g., going over/under a low wall) are not directly penalized by the goal shaping.
-        vel_vec_goal = self.drone.vel_w[..., :2] if goal_use_planar else self.drone.vel_w[..., :3]
-        reward_goal = self._compute_goal_reward(
-            vel_vec_goal, vel_direction,
-            self.last_dis2goal, dis2goal
-        ).view(-1, 1)
-
-        # -------------------------
-        # risk scalar + gating / relax
+        # risk scalar + gating / relax (compute early for risk-conditioned shaping)
         # -------------------------
         risk_gate_goal = bool(self.cfg.task.get("risk_gate_goal", True))
         risk_relax_enable = bool(self.cfg.task.get("risk_relax_enable", True))
@@ -1683,6 +1804,44 @@ class Env(IsaacEnv):
         else:
             risk_smax = torch.zeros(self.num_envs, device=self.device)
         risk_smax_col = risk_smax.view(-1, 1)
+
+        # -------------------------
+        # speed reward (cruise speed shaping)
+        # R_v = exp(-((||v|| - v_ref)^2) / sigma_v^2)
+        # Optional: risk-conditioned speed target (slow down only in high-risk zones).
+        # -------------------------
+        try:
+            v_ref = float(self.cfg.task.get("v_ref", self.cfg.task.get("speed_ref", (self.vel_min + self.vel_max) * 0.5)))
+        except Exception:
+            v_ref = float((self.vel_min + self.vel_max) * 0.5)
+        try:
+            sigma_v = float(self.cfg.task.get("sigma_v", self.cfg.task.get("speed_sigma", max(0.5, 0.2 * float(self.vel_max)))))
+        except Exception:
+            sigma_v = max(0.5, 0.2 * float(self.vel_max))
+        sigma_v = float(max(sigma_v, 1.0e-3))
+
+        risk_speed_enable = bool(self.cfg.task.get("risk_speed_enable", False))
+        if risk_speed_enable:
+            k = float(self.cfg.task.get("risk_speed_k", 1.0))
+            min_scale = float(self.cfg.task.get("risk_speed_min_scale", 0.5))
+            sigma_scale = float(self.cfg.task.get("risk_speed_sigma_scale", 1.2))
+            scale = (1.0 - k * risk_smax_col).clamp(min=min_scale, max=1.0)
+            v_ref_eff = v_ref * scale
+            sigma_v_eff = sigma_v * (1.0 + (sigma_scale - 1.0) * risk_smax_col)
+        else:
+            v_ref_eff = v_ref
+            sigma_v_eff = sigma_v
+        vel_col = vel_magnitude.view(-1, 1)
+        reward_vel = torch.exp(-((vel_col - v_ref_eff) ** 2) / (sigma_v_eff ** 2 + 1.0e-6)).view(-1, 1)
+
+        # goal reward (ungated)
+        # Use planar velocity/direction when goal_use_planar is enabled, so vertical maneuvers
+        # (e.g., going over/under a low wall) are not directly penalized by the goal shaping.
+        vel_vec_goal = self.drone.vel_w[..., :2] if goal_use_planar else self.drone.vel_w[..., :3]
+        reward_goal = self._compute_goal_reward(
+            vel_vec_goal, vel_direction,
+            self.last_dis2goal, dis2goal
+        ).view(-1, 1)
 
         # height reward with deadband + barrier + risk gate
         reward_height = self._compute_height_reward(
@@ -1708,8 +1867,12 @@ class Env(IsaacEnv):
             eta_j = float(self.cfg.task.get("risk_relax_eta_j", 0.5))
             eta_j = float(max(0.0, min(1.0, eta_j)))
             w_j_eff = (w_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
+            eta_a = float(self.cfg.task.get("risk_relax_eta_a", 0.0))
+            eta_a = float(max(0.0, min(1.0, eta_a)))
+            w_a_eff = (w_a * (1.0 - eta_a * risk_smax_col)).clamp_min(0.0)
         else:
             w_j_eff = torch.full_like(reward_jerk, w_j)
+            w_a_eff = torch.full_like(reward_acc, w_a)
 
         # -------------------------
         # risk avoidance reward (soft threshold + smooth growth)
@@ -1725,15 +1888,44 @@ class Env(IsaacEnv):
             reward_risk = -w_r * F.softplus(alpha * (risk_smax_col - rho0))
 
         # -------------------------
+        # risk-delta shaping (encourage timely avoidance)
+        # -------------------------
+        reward_risk_delta = torch.zeros_like(reward_goal)
+        if bool(self.cfg.task.get("risk_delta_enable", False)):
+            w_rd = float(self.cfg.task.get("risk_delta_w", 1.0))
+            delta_clip = float(self.cfg.task.get("risk_delta_clip", 0.5))
+            rcfg = self.cfg.task.get("risk_cfg", {})
+            rho_focus = float(self.cfg.task.get("risk_delta_rho", rcfg.get("rho0", 0.2)))
+
+            if self.last_risk_smax is None:
+                self.last_risk_smax = risk_smax.clone()
+            if self.last_risk_valid is None:
+                self.last_risk_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+            prev = self.last_risk_smax.view(-1, 1)
+            valid = self.last_risk_valid.view(-1, 1)
+            prev = torch.where(valid, prev, risk_smax_col)
+            # Only reward *reductions* in risk to encourage timely avoidance
+            # (do not penalize increases here; risk penalty already covers that).
+            delta = (prev - risk_smax_col).clamp(min=0.0, max=delta_clip)
+
+            focus_prev = (prev - rho_focus).clamp(min=0.0)
+            focus_now = (risk_smax_col - rho_focus).clamp(min=0.0)
+            focus = torch.maximum(focus_prev, focus_now)
+
+            reward_risk_delta = w_rd * delta * focus
+
+        # -------------------------
         # total reward (before collision penalty)
         # -------------------------
         reward = (
             w_v * reward_vel
-            + w_a * reward_acc
+            + w_a_eff * reward_acc
             + w_j_eff * reward_jerk
             + reward_height
             + w_g * reward_goal
             + reward_risk
+            + reward_risk_delta
         ).view(-1, 1)
 
         # success bonus (optional)
@@ -1774,10 +1966,33 @@ class Env(IsaacEnv):
             else:
                 reward = reward - time_penalty
 
+        # soft boundary shaping (before hard bound termination):
+        # penalize trajectories that drift close to the corridor boundary so
+        # policy avoids late boundary terminations in L3/L4.
+        bound_line_max_dist = float(self.cfg.task.get("bound_line_max_dist", 8.0))
+        reward_bound = torch.zeros_like(reward_goal)
+        if bool(self.cfg.task.get("bound_soft_penalty_enable", False)):
+            drone_xy = self.drone_state[..., :2].squeeze(1)
+            start_xy = self.start_pos[..., :2].squeeze(1)
+            target_xy = self.target_pos[..., :2].squeeze(1)
+            A = target_xy[:, 1] - start_xy[:, 1]
+            B = start_xy[:, 0] - target_xy[:, 0]
+            C = target_xy[:, 0] * start_xy[:, 1] - start_xy[:, 0] * target_xy[:, 1]
+            denom = torch.sqrt(A * A + B * B + 1.0e-6)
+            line_dist = (torch.abs(A * drone_xy[:, 0] + B * drone_xy[:, 1] + C) / denom).view(-1, 1)
+
+            margin_ratio = float(self.cfg.task.get("bound_soft_margin_ratio", 0.7))
+            margin_ratio = float(max(0.0, min(0.99, margin_ratio)))
+            soft_dist = margin_ratio * bound_line_max_dist
+            norm = max(1.0e-6, bound_line_max_dist - soft_dist)
+            excess = ((line_dist - soft_dist) / norm).clamp(min=0.0)
+            bound_w = float(self.cfg.task.get("bound_soft_penalty_w", 2.0))
+            reward_bound = -bound_w * (excess ** 2)
+            reward = reward + reward_bound
+
         # -------------------------
         # termination masks
         # -------------------------
-        bound_line_max_dist = float(self.cfg.task.get("bound_line_max_dist", 8.0))
         bound_misbehave = env_utils.get_bound_misbehave(
             self.drone_state[..., :2].squeeze(1),
             self.start_pos[..., :2].squeeze(1),
@@ -1819,10 +2034,10 @@ class Env(IsaacEnv):
             pen = float(self.cfg.task.get("height_high_penalty", 0.0))
             if pen != 0.0:
                 reward = reward - pen * height_high.float()
-        if not terminate_on_vel_limit:
-            pen = float(self.cfg.task.get("vel_limit_penalty", 0.0))
-            if pen != 0.0:
-                reward = reward - pen * vel_limit_mask.float()
+        # vel-limit penalty always applies (shaping), regardless of termination toggle
+        pen = float(self.cfg.task.get("vel_limit_penalty", 0.0))
+        if pen != 0.0:
+            reward = reward - pen * vel_limit_mask.float()
 
         misbehave = (
             height_low
@@ -1961,14 +2176,14 @@ class Env(IsaacEnv):
         self.stats["reward_height"].add_(reward_height)
         self.stats["reward_goal"].add_(reward_goal)
         self.stats["reward_risk"].add_(reward_risk)
+        self.stats["reward_risk_delta"].add_(reward_risk_delta)
         self.stats["reward_collision"].add_(reward_collision)
+        self.stats["reward_bound"].add_(reward_bound)
 
         # scalar diagnostics (store current-step values, not accumulated sums)
         self.stats["risk_smax"].copy_(risk_smax_col)
         self.stats["goal_gate"].copy_(goal_gate)
         # Temporal observation diagnostics (current-step values)
-        if self.temporal_reset_rate is not None:
-            self.stats["temporal_reset_rate"].copy_(self.temporal_reset_rate)
         if self.radial_valid_ratio is not None:
             self.stats["radial_valid_ratio"].copy_(self.radial_valid_ratio)
         if self.radial_abs_mean is not None:
@@ -1992,6 +2207,9 @@ class Env(IsaacEnv):
         if self.last_acc_valid is not None:
             self.last_acc_valid[:] = True
         self.last_dis2goal = dis2goal
+        self.last_risk_smax = risk_smax
+        if self.last_risk_valid is not None:
+            self.last_risk_valid[:] = True
 
         plan_success = success_mask
         flight_success = success_mask & (~terminated_base) & (~truncated)
@@ -2349,6 +2567,33 @@ class Env(IsaacEnv):
 
             # keep the same far-mask
             H = torch.where(mask, H, torch.zeros_like(H))
+
+        # -------------------------
+        # static/slow clearance integrated into risk (optional)
+        # -------------------------
+        static_enable = bool(rcfg.get("static_enable", False))
+        if static_enable:
+            static_w = float(rcfg.get("static_w", 0.6))
+            static_dist = float(rcfg.get("static_dist", 2.5))
+            static_sigma = float(rcfg.get("static_sigma", 0.6))
+            static_radial_max = float(rcfg.get("static_radial_norm_max", 0.12))
+            static_flow_max = float(rcfg.get("static_flow_norm_max", 0.25))
+
+            radial_abs = radial_channel.abs()
+            slow_mask = radial_abs <= static_radial_max
+            if flow is not None:
+                if flow.ndim == 3:
+                    flow = flow.unsqueeze(1)
+                flow_mag = torch.sqrt(flow[:, 0:1] ** 2 + flow[:, 1:2] ** 2)
+                flow_mag = flow_mag / max(flow_clip, 1.0e-6)
+                flow_mag = torch.clamp(flow_mag, 0.0, 1.0)
+                slow_mask = slow_mask & (flow_mag <= static_flow_max)
+
+            static_sigma = max(static_sigma, 1.0e-3)
+            H_static = torch.sigmoid((static_dist - r) / static_sigma)
+            H_static = torch.where(mask, H_static, torch.zeros_like(H_static))
+
+            H = torch.maximum(H, static_w * H_static * slow_mask.float())
 
         # -------------------------
         # masked-softmax aggregation to scalar risk

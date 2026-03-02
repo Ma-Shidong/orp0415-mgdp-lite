@@ -34,7 +34,7 @@ virtual_ceiling: 3.5
 # -----------------------------
 # Inference-only (ROS sim) opts
 # -----------------------------
-ckpt_path: "../models/orp5.13.pt"  # override if you want to test a different checkpoint
+ckpt_path: "../models/orp7.2.pt"  # override if you want to test a different checkpoint
 auto_test: true           # if no RViz goal is provided, use default_goal_xyz
 auto_test_toggle: false   # true = keep toggling between auto_goal_a/auto_goal_b
 start_xyz: [0.0, -15.0, 2.0]

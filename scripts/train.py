@@ -1,6 +1,8 @@
 import logging
 import os
 import itertools
+import random
+from contextlib import nullcontext
 
 import hydra
 import torch
@@ -49,8 +51,10 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.03 # 熵正则系数，鼓励策略保持随机性（探索），避免过早“变得很确定”
-        self.clip_param = 0.25 # 限制策略更新幅度，越大越敢于更新
+        # Entropy regularization coefficient (exploration). Make it configurable.
+        # Lower -> more stable, less random.
+        self.entropy_coef = float(getattr(cfg, "entropy_coef", 0.01))
+        self.clip_param = 0.2 # 限制策略更新幅度，越大越敢于更新
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
         self.gae = GAE(0.995, 0.95)
@@ -73,7 +77,16 @@ class PPOPolicy(TensorDictModuleBase):
         ).to(self.device)
 
         self.actor = ProbabilisticActor(
-            TensorDictModule(Actor(self.action_dim), ["_feature"], ["loc", "scale"]),
+            TensorDictModule(
+                Actor(
+                    self.action_dim,
+                    log_std_min=float(getattr(cfg, "actor_log_std_min", -2.5)),
+                    log_std_max=float(getattr(cfg, "actor_log_std_max", 0.0)),
+                    log_std_init=float(getattr(cfg, "actor_log_std_init", 0.0)),
+                ),
+                ["_feature"],
+                ["loc", "scale"],
+            ),
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
@@ -99,9 +112,9 @@ class PPOPolicy(TensorDictModuleBase):
         # self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=3e-4)
         # self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
         # self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=1e-4)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=2e-4)
+        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=1.5e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1.5e-4)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
         
         self.value_norm = ValueNorm1(1).to(self.device)
 
@@ -229,7 +242,7 @@ class SuccessCurriculum:
         self.ema_success = 0.0
         self._pat = 0
         self._cool = 0
-        self._last_switch_iter = -10**9
+        self._last_switch_iter = -1
         self._last_check_idx = -1
 
     def maybe_update(self, it: int, success_raw: float) -> Dict[str, float]:
@@ -256,6 +269,8 @@ class SuccessCurriculum:
             "curriculum/cooldown_left": float(self._cool),
             "curriculum/threshold": float(threshold),
             "curriculum/patience_count": float(self._pat),
+            "curriculum/last_switch_iter": float(self._last_switch_iter),
+            "curriculum/iters_since_switch": float(0 if self._last_switch_iter < 0 else max(0, int(it) - int(self._last_switch_iter))),
         }
         if not enabled:
             return out
@@ -295,10 +310,13 @@ class SuccessCurriculum:
             self.level = next_level
             self._pat = 0
             self._cool = self.cooldown
+            self._last_switch_iter = int(it)
             out["curriculum/switch"] = 1.0
             out["curriculum/level"] = float(self.level)
             out["curriculum/patience_count"] = float(self._pat)
             out["curriculum/cooldown_left"] = float(self._cool)
+            out["curriculum/last_switch_iter"] = float(self._last_switch_iter)
+            out["curriculum/iters_since_switch"] = 0.0
 
             if self.reset_ema_on_switch:
                 self.ema_success = 0.0
@@ -385,8 +403,13 @@ def main(cfg):
             f"Check your config and frames_per_batch={frames_per_batch}."
         )
     eval_interval = cfg.get("eval_interval", -1)
+    eval_num_episodes = int(cfg.get("eval_num_episodes", 64))
+    eval_max_steps = int(cfg.get("eval_max_steps", base_env.max_episode_length))
+    eval_video_max_steps = int(cfg.get("eval_video_max_steps", eval_max_steps))
     save_interval = cfg.get("save_interval", -1)
     record_video = bool(cfg.get("record_video", True))
+    eval_seed_mode = str(cfg.get("eval_seed_mode", "random")).lower()
+    eval_seed = cfg.get("eval_seed", None)
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -402,18 +425,38 @@ def main(cfg):
         return_same_td=True,
     )
 
+    eval_counter = 0
+
+    def _next_eval_seed() -> Optional[int]:
+        nonlocal eval_counter
+        if eval_seed_mode == "fixed":
+            seed = int(eval_seed) if eval_seed is not None else int(cfg.seed)
+        elif eval_seed_mode == "sequence":
+            base_seed = int(eval_seed) if eval_seed is not None else int(cfg.seed)
+            seed = base_seed + eval_counter
+        elif eval_seed_mode == "none":
+            seed = None
+        else:
+            seed = random.randint(0, 2**31 - 1)
+        eval_counter += 1
+        return seed
+
     @torch.no_grad()
     def evaluate(
-        seed: int = 0,
+        seed: Optional[int] = None,
         render_video: bool = False,
-        exploration_type: ExplorationType = ExplorationType.MODE,
+        exploration_type: Optional[ExplorationType] = ExplorationType.MODE,
         prefix: str = "eval",
     ):
 
-        base_env.enable_render(True)
+        # Stats-only eval does not need viewport rendering. For headless runs,
+        # forcing render here can wake up the Vulkan viewport path and crash the
+        # process with device-lost/pagefault errors.
+        base_env.enable_render(bool(render_video))
         base_env.eval()
         env.eval()
-        env.set_seed(seed)
+        if seed is not None:
+            env.set_seed(int(seed))
 
         render_callback = None
 
@@ -428,8 +471,12 @@ def main(cfg):
         episode_stats = EpisodeStats(stats_keys)
         td = env.reset()
 
-        with set_exploration_type(exploration_type):
-            for _ in range(base_env.max_episode_length):
+        ctx = set_exploration_type(exploration_type) if exploration_type is not None else nullcontext()
+        with ctx:
+            max_steps = eval_video_max_steps if render_video else eval_max_steps
+            max_steps = max(1, int(max_steps))
+            target_episodes = max(1, int(eval_num_episodes))
+            for _ in range(max_steps):
                 if render_video and render_callback:
                     render_callback(env)
                 td = policy(td)
@@ -437,13 +484,18 @@ def main(cfg):
                 episode_stats.add(td)
                 # advance to next step
                 td = td["next"]
-                if len(episode_stats) >= env.num_envs:
+                if len(episode_stats) >= target_episodes:
                     break
 
         base_env.enable_render(not cfg.headless)
         env.reset()
 
+        if len(episode_stats) == 0:
+            return {f"{prefix}/episode_samples": 0.0}
+
         traj_stats = episode_stats.pop()
+        if len(traj_stats) > target_episodes:
+            traj_stats = traj_stats[:target_episodes]
         # NOTE: EpisodeStats.pop() returns a TensorDict that may contain nested
         # TensorDict values (e.g., {"stats": TensorDict(...)}). Using
         # `.items(True, True)` flattens it into leaf tensors, consistent with
@@ -451,13 +503,28 @@ def main(cfg):
         traj_stats = traj_stats.cpu()
         stats_mean = {k: v.float().mean().item() for k, v in traj_stats.items(True, True)}
 
-        info = {}
+        info = {f"{prefix}/episode_samples": float(len(traj_stats))}
+        if seed is not None:
+            info[f"{prefix}/seed"] = int(seed)
+        skip_substrings = ("curriculum",)
+        skip_keys = {
+            "stats.truncated",
+            "stats.terminated",
+            "stats.temporal_reset_rate",
+            "stats.done_any",
+        }
+        avg_speed_val = stats_mean.get(("stats", "avg_speed"))
+        if avg_speed_val is not None:
+            info[f"{prefix}/avg_speed"] = float(avg_speed_val)
+
         for k, v in stats_mean.items():
             # k is usually a tuple like ("stats", "done_success")
             if isinstance(k, tuple):
                 key_str = ".".join(map(str, k))
             else:
                 key_str = str(k)
+            if key_str in skip_keys or any(s in key_str for s in skip_substrings):
+                continue
             info[f"{prefix}/{key_str}"] = float(v)
 
         if render_video and render_callback:
@@ -475,20 +542,91 @@ def main(cfg):
     # "no iteration limit" and iterate the collector until total_frames.
     iterator = itertools.islice(collector, max_iters) if max_iters > 0 else iter(collector)
 
+    def _log_scalar(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
     pbar = tqdm(iterator)
     env.train()
     for i, data in enumerate(pbar):
-        info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+        info = {"iter": i, "env_frames": collector._frames, "rollout_fps": collector._fps}
+        log_ready = False
+        td = data.to_tensordict()
         episode_stats.add(data.to_tensordict())
 
+        # Optional: log batch-level stats more frequently to keep W&B curves fresh
+        log_interval_iters = int(cfg.task.get("log_interval_iters", 0))
+        if log_interval_iters > 0 and (i % log_interval_iters == 0):
+            try:
+                batch_stats = td["next"]["stats"]
+                batch_mean = {k: v.mean().item() for k, v in batch_stats.items(True, True)}
+                for k, v in batch_mean.items():
+                    key_str = ".".join(k)
+                    # keep batch logs lightweight and avoid curriculum/meta noise
+                    if key_str.startswith("stats.done_ratio_"):
+                        continue
+                    if key_str.startswith("stats.curriculum_"):
+                        continue
+                    info[f"train_batch/{key_str}"] = v
+            except Exception:
+                # do not fail training if batch stats are missing
+                pass
+
+        # Entropy schedule (decoupled from level by default):
+        # - by_switch_age: decay within each level using iterations since last switch.
+        # - by_level: legacy behavior coupled to unlocked curriculum level.
+        try:
+            ent_start = float(getattr(cfg.algo, "entropy_coef", 0.01))
+            ent_mid = float(getattr(cfg.algo, "entropy_coef_mid"))
+            ent_end = float(getattr(cfg.algo, "entropy_coef_end"))
+            f1 = float(getattr(cfg.algo, "entropy_anneal_frac1", 0.3))
+            f2 = float(getattr(cfg.algo, "entropy_anneal_frac2", 0.7))
+            mode = str(getattr(cfg.algo, "entropy_schedule_mode", "by_switch_age")).lower()
+            if mode in ("by_level", "level"):
+                max_level = 0
+                if hasattr(cfg.task, "success_curriculum") and hasattr(cfg.task.success_curriculum, "levels"):
+                    try:
+                        max_level = max(0, len(cfg.task.success_curriculum.levels) - 1)
+                    except Exception:
+                        max_level = 0
+                unlocked_level = 0
+                try:
+                    unlocked_level = int(getattr(curr_mgr, "level", 0))
+                except Exception:
+                    unlocked_level = 0
+                if max_level <= 0:
+                    progress = 0.0
+                else:
+                    progress = float(max(0, min(unlocked_level, max_level))) / float(max_level)
+            else:
+                decay_iters = int(getattr(cfg.algo, "entropy_decay_iters_per_level", 600))
+                decay_iters = max(1, decay_iters)
+                last_switch_iter = int(getattr(curr_mgr, "_last_switch_iter", -1))
+                if last_switch_iter < 0:
+                    age = int(i)
+                else:
+                    age = max(0, int(i) - last_switch_iter)
+                progress = min(1.0, float(age) / float(decay_iters))
+                info["train/entropy_age_iters"] = float(age)
+                info["train/entropy_schedule_progress"] = float(progress)
+            if progress <= f1:
+                ent_coef = ent_start
+            elif progress <= f2:
+                ent_coef = ent_start + (ent_mid - ent_start) * ((progress - f1) / max(1e-6, (f2 - f1)))
+            else:
+                ent_coef = ent_mid + (ent_end - ent_mid) * ((progress - f2) / max(1e-6, (1.0 - f2)))
+            policy.entropy_coef = float(ent_coef)
+            info["train/entropy_coef"] = float(ent_coef)
+        except Exception:
+            pass
+
         if len(episode_stats) >= cfg.task.env.num_envs:
-            info = {
-                "iter": i,
-                "env_frames": collector._frames,
-                "frames_per_batch": frames_per_batch,
-                "rollout_fps": collector._fps,
-                "train/episode_samples": len(episode_stats),
-            }
+            log_ready = True
+            info.update(
+                {
+                    "frames_per_batch": frames_per_batch,
+                    "train/episode_samples": len(episode_stats),
+                }
+            )
 
             stats_td = episode_stats.pop()
             stats_mean = {k: v.mean().item() for k, v in stats_td.items(True, True)}
@@ -514,10 +652,26 @@ def main(cfg):
                     print(f"[Curriculum] switch failed: {e}")
 
             # log stats (filter duplicates)
+            avg_speed_val = stats_mean.get(("stats", "avg_speed"))
+            if avg_speed_val is not None:
+                info["train/avg_speed"] = float(avg_speed_val)
+
             for k, v in stats_mean.items():
                 key_str = ".".join(k)
                 # 过滤 done_ratio_*（和 done_*重复）
                 if key_str.startswith("stats.done_ratio_"):
+                    continue
+                if key_str == "stats.curriculum_static_obs_num_per_grid":
+                    info["curriculum/static_obs_num_total"] = v
+                    continue
+                if key_str == "stats.curriculum_dobs_active":
+                    info["curriculum/dobs_active"] = v
+                    continue
+                if key_str == "stats.curriculum_level":
+                    info["curriculum/level_env"] = v
+                    continue
+                if key_str == "stats.curriculum_reset":
+                    info["curriculum/reset_env"] = v
                     continue
                 info[f"train/{key_str}"] = v
 
@@ -526,12 +680,14 @@ def main(cfg):
         if eval_interval > 0 and i % eval_interval == 0 and i != 0:
             logging.info(f"Eval at {collector._frames} steps.") 
             try:
-                # Eval with deterministic action selection (distribution mode / mean)
-                info.update(evaluate(render_video=False, exploration_type=ExplorationType.MODE, prefix="eval_mode"))
-                # Eval with stochastic action sampling (helps detect multi-modal policies)
-                _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
-                if _sample_expl is not None:
-                    info.update(evaluate(render_video=False, exploration_type=_sample_expl, prefix="eval_sample"))
+                info.update(
+                    evaluate(
+                        seed=_next_eval_seed(),
+                        render_video=False,
+                        exploration_type=ExplorationType.MODE,
+                        prefix="eval",
+                    )
+                )
             except Exception as e:
                 logging.exception(f"Eval failed (skipping this eval): {e}")
             env.train()
@@ -544,28 +700,10 @@ def main(cfg):
                 logging.info(f"Saved checkpoint to {str(ckpt_path)}")
             except AttributeError:
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
-            
-            if record_video:
-                logging.info(f"Eval and render video at {collector._frames} steps.")
-                try:
-                    info.update(evaluate(render_video=True, exploration_type=ExplorationType.MODE, prefix="eval_mode"))
-                    _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
-                    if _sample_expl is not None:
-                        info.update(evaluate(render_video=False, exploration_type=_sample_expl, prefix="eval_sample"))
-                except Exception as e:
-                    logging.exception(f"Video eval failed (skipping video): {e}")
-            else:
-                logging.info(f"Eval at {collector._frames} steps (video disabled).")
-                try:
-                    info.update(evaluate(render_video=False, exploration_type=ExplorationType.MODE, prefix="eval_mode"))
-                    _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
-                    if _sample_expl is not None:
-                        info.update(evaluate(render_video=False, exploration_type=_sample_expl, prefix="eval_sample"))
-                except Exception as e:
-                    logging.exception(f"Eval failed (skipping this eval): {e}")
 
         run.log(info)
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
+        if log_ready:
+            print(OmegaConf.to_yaml({k: v for k, v in info.items() if _log_scalar(v)}))
 
         pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
 
@@ -573,10 +711,13 @@ def main(cfg):
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}
     try:
-        info.update(evaluate(exploration_type=ExplorationType.MODE, prefix="eval_mode"))
-        _sample_expl = getattr(ExplorationType, "RANDOM", None) or getattr(ExplorationType, "SAMPLE", None)
-        if _sample_expl is not None:
-            info.update(evaluate(exploration_type=_sample_expl, prefix="eval_sample"))
+        info.update(
+            evaluate(
+                seed=_next_eval_seed(),
+                exploration_type=ExplorationType.MODE,
+                prefix="eval",
+            )
+        )
     except Exception as e:
         logging.exception(f"Final eval failed: {e}")
     run.log(info)

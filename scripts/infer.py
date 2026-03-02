@@ -424,7 +424,7 @@ class Infer:
             device=self.device
         )
         
-        ckpt_path = str(self.cfg.task.get("ckpt_path", "../models/orp5.13.pt"))
+        ckpt_path = str(self.cfg.task.get("ckpt_path", "../models/orp7.2.pt"))
         # Hydra may chdir into outputs/...; resolve checkpoint path robustly.
         if not os.path.isabs(ckpt_path):
             try:

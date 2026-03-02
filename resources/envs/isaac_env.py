@@ -121,7 +121,9 @@ class IsaacEnv(EnvBase):
         # store inputs to class
         self.cfg = cfg
         self.enable_render(not headless)
-        self.enable_viewport = True
+        # In headless training runs, keep the viewport/render product disabled
+        # unless video capture is explicitly requested.
+        self.enable_viewport = (not headless) or bool(cfg.get("record_video", False))
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
         self.max_episode_length = self.cfg.env.max_episode_length
@@ -200,10 +202,11 @@ class IsaacEnv(EnvBase):
         # find the environment closest to the origin for visualization
         self.central_env_idx = self.envs_positions.norm(dim=-1).argmin()
         central_env_pos = self.envs_positions[self.central_env_idx].cpu().numpy()
-        set_camera_view(
-            eye=central_env_pos + np.asarray(self.cfg.viewer.eye),
-            target=central_env_pos + np.asarray(self.cfg.viewer.lookat)
-        )
+        if self.enable_viewport:
+            set_camera_view(
+                eye=central_env_pos + np.asarray(self.cfg.viewer.eye),
+                target=central_env_pos + np.asarray(self.cfg.viewer.lookat)
+            )
 
         RobotBase._envs_positions = self.envs_positions.unsqueeze(1)
 
@@ -472,6 +475,10 @@ class IsaacEnv(EnvBase):
 
     def _create_viewport_render_product(self):
         """Create a render product of the viewport for rendering."""
+        if not self.enable_viewport:
+            carb.log_info("Viewport is disabled. Skipping creation of render product.")
+            return
+
         # set camera view for "/OmniverseKit_Persp" camera
         set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
 
@@ -484,19 +491,15 @@ class IsaacEnv(EnvBase):
         #     # acquire flatcache interface
         #     self._flatcache_iface = get_physx_flatcache_interface()
 
-        # check if viewport is enabled before creating render product
-        if self.enable_viewport:
-            import omni.replicator.core as rep
+        import omni.replicator.core as rep
 
-            # create render product
-            self._render_product = rep.create.render_product(
-                "/OmniverseKit_Persp", tuple(self.cfg.viewer.resolution)
-            )
-            # create rgb annotator -- used to read data from the render product
-            self._rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
-            self._rgb_annotator.attach([self._render_product])
-        else:
-            carb.log_info("Viewport is disabled. Skipping creation of render product.")
+        # create render product
+        self._render_product = rep.create.render_product(
+            "/OmniverseKit_Persp", tuple(self.cfg.viewer.resolution)
+        )
+        # create rgb annotator -- used to read data from the render product
+        self._rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+        self._rgb_annotator.attach([self._render_product])
 
 
 class _AgentSpecView(Dict[str, AgentSpec]):

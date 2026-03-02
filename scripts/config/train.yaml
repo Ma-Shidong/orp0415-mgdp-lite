@@ -10,18 +10,41 @@ headless: false  # default to headless to avoid GLX errors on servers without a 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 500_000_000
+total_frames: 750_000_000
 max_iters: -1
-eval_interval: 500
+eval_interval: 100
 save_interval: 500
 
 # Evaluation rollout length (steps). Higher = more accurate but slower and higher memory.
-eval_max_steps: 1024
+eval_max_steps: 3000
+# Number of finished episodes per eval (fixed-size diagnostic sample).
+eval_num_episodes: 128
 # If you save videos, keep this smaller to avoid huge files.
 eval_video_max_steps: 256
 record_video: false
+eval_seed_mode: random # random | fixed | sequence | none
+eval_seed: 0
 
 seed: 0
+
+# PPO exploration / stability (can be overridden via CLI)
+algo:
+  entropy_coef: 0.011
+  entropy_coef_mid: 0.0045
+  entropy_coef_end: 0.0010
+  entropy_anneal_frac1: 0.40
+  entropy_anneal_frac2: 0.85
+  entropy_schedule_mode: by_switch_age  # by_switch_age | by_level
+  entropy_decay_iters_per_level: 1800
+  actor_log_std_min: -1.6
+  actor_log_std_max: 0.5
+  actor_log_std_init: -0.35
+  actor_lr: 0.00012
+  critic_lr: 0.00025
+  clip_param: 0.20
+  ppo_epochs: 4
+  num_minibatches: 4
+
 # resume_checkpoint: /home/csj/orp/models/orp6.1.pt
 resume_checkpoint: null  # set to a .pt path to continue training, keep null to start from scratch
 

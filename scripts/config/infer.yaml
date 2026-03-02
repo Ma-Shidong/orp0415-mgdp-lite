@@ -8,3 +8,14 @@ defaults:
   - task: infer_ros_env
   - algo: ppo
   - _self_
+
+# PPO exploration / stability (keep consistent with training)
+algo:
+  entropy_coef: 0.01
+  entropy_coef_mid: 0.002
+  entropy_coef_end: 0.0002
+  entropy_anneal_frac1: 0.3
+  entropy_anneal_frac2: 0.7
+  actor_log_std_min: -2.0
+  actor_log_std_max: 0.5
+  actor_log_std_init: -0.5

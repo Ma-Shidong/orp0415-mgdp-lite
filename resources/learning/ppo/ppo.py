@@ -22,6 +22,7 @@
 
 
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
@@ -48,6 +49,31 @@ class PPOConfig:
     ppo_epochs: int = 4 #同一份 rollout 数据被重复用多少次
     num_minibatches: int = 4 #16 每个 epoch 切成多少小批
 
+
+    # Exploration / regularization
+    # Lower = less random, more stable. Keep some exploration for curriculum.
+    entropy_coef: float = 0.01
+
+    # Actor log-std bounds (stability). std = exp(log_std).
+    # Typical range: [-2.0, 0.5] => std in [0.14, 1.65]
+    actor_log_std_min: float = -2.0
+    actor_log_std_max: float = 0.5
+    # log-std init (in log-std space; mapped to raw param internally)
+    actor_log_std_init: float = -0.5
+    # Optional entropy anneal (set in config; handled in train.py)
+    entropy_coef_mid: float = 0.002
+    entropy_coef_end: float = 0.0002
+    entropy_anneal_frac1: float = 0.3
+    entropy_anneal_frac2: float = 0.7
+    # Entropy schedule:
+    # - by_switch_age: decay after each curriculum switch (recommended).
+    # - by_level: legacy behavior coupled to unlocked curriculum level.
+    entropy_schedule_mode: str = "by_switch_age"
+    entropy_decay_iters_per_level: int = 600
+    actor_lr: float = 1.0e-4
+    critic_lr: float = 2.0e-4
+    clip_param: float = 0.2
+
     # whether to use privileged information
     priv_actor: bool = False
     priv_critic: bool = False
@@ -70,14 +96,47 @@ def make_mlp(num_units):
 
 
 class Actor(nn.Module):
-    def __init__(self, action_dim: int) -> None:
+    def __init__(
+        self,
+        action_dim: int,
+        log_std_min: float = -2.5,
+        log_std_max: float = 0.0,
+        log_std_init: float = 0.0,
+    ) -> None:
         super().__init__()
         self.actor_mean = nn.LazyLinear(action_dim)
-        self.actor_std = nn.Parameter(torch.zeros(action_dim))
+
+        # Clamp bounds (keep ordered).
+        lo = float(log_std_min)
+        hi = float(log_std_max)
+        if hi < lo:
+            lo, hi = hi, lo
+        self.log_std_min = lo
+        self.log_std_max = hi
+        init = float(log_std_init)
+        # Interpret log_std_init in log-std space and map to raw parameter if squashing is enabled.
+        if self.log_std_min is not None and self.log_std_max is not None:
+            if self.log_std_max > self.log_std_min + 1e-6:
+                init = max(self.log_std_min, min(self.log_std_max, init))
+                t = (2.0 * (init - self.log_std_min) / (self.log_std_max - self.log_std_min)) - 1.0
+                t = max(-0.999, min(0.999, t))
+                init = math.atanh(t)
+            else:
+                init = 0.0
+
+        # Learnable raw log-std parameter (shared across all features).
+        self.actor_std = nn.Parameter(torch.full((action_dim,), float(init)))
 
     def forward(self, features: torch.Tensor):
         loc = self.actor_mean(features)
-        scale = torch.exp(self.actor_std).expand_as(loc)
+
+        log_std = self.actor_std
+        # Use smooth squashing to keep gradients alive and stay within [min, max].
+        if self.log_std_min is not None and self.log_std_max is not None:
+            t = torch.tanh(log_std)  # (-1, 1)
+            log_std = self.log_std_min + 0.5 * (t + 1.0) * (self.log_std_max - self.log_std_min)
+
+        scale = torch.exp(log_std).expand_as(loc)
         return loc, scale
 
 class BetaActor(nn.Module):
@@ -107,8 +166,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.01
-        self.clip_param = 0.2
+        self.entropy_coef = float(getattr(cfg, "entropy_coef", 0.01))
+        self.clip_param = float(getattr(cfg, "clip_param", 0.2))
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
         self.gae = GAE(0.99, 0.95)
@@ -125,13 +184,29 @@ class PPOPolicy(TensorDictModuleBase):
                 ),
                 CatTensors(["feature", "context"], "feature"),
                 TensorDictModule(
-                    nn.Sequential(make_mlp([256, 256]), Actor(self.action_dim)),
+                    nn.Sequential(
+                        make_mlp([256, 256]),
+                        Actor(
+                            self.action_dim,
+                            log_std_min=float(getattr(self.cfg, "actor_log_std_min", -2.5)),
+                            log_std_max=float(getattr(self.cfg, "actor_log_std_max", 0.0)),
+                            log_std_init=float(getattr(self.cfg, "actor_log_std_init", 0.0)),
+                        ),
+                    ),
                     ["feature"], ["loc", "scale"]
                 )
             )
         else:
             actor_module=TensorDictModule(
-                nn.Sequential(make_mlp([256, 256, 256]), Actor(self.action_dim)),
+                nn.Sequential(
+                    make_mlp([256, 256, 256]),
+                        Actor(
+                            self.action_dim,
+                            log_std_min=float(getattr(self.cfg, "actor_log_std_min", -2.5)),
+                            log_std_max=float(getattr(self.cfg, "actor_log_std_max", 0.0)),
+                            log_std_init=float(getattr(self.cfg, "actor_log_std_init", 0.0)),
+                        ),
+                ),
                 [("agents", "observation")], ["loc", "scale"]
             )
         self.actor: ProbabilisticActor = ProbabilisticActor(
@@ -177,8 +252,10 @@ class PPOPolicy(TensorDictModuleBase):
             self.actor.apply(init_)
             self.critic.apply(init_)
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=2e-4)
+        actor_lr = float(getattr(self.cfg, "actor_lr", 1.0e-4))
+        critic_lr = float(getattr(self.cfg, "critic_lr", 2.0e-4))
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.value_norm = ValueNorm1(reward_spec.shape[-2:]).to(self.device)
 
     def __call__(self, tensordict: TensorDict):
