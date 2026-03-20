@@ -10,7 +10,7 @@ headless: false  # default to headless to avoid GLX errors on servers without a 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 750_000_000
+total_frames: 1_500_000_000
 max_iters: -1
 eval_interval: 100
 save_interval: 500
@@ -29,19 +29,23 @@ seed: 0
 
 # PPO exploration / stability (can be overridden via CLI)
 algo:
-  entropy_coef: 0.011
-  entropy_coef_mid: 0.0045
-  entropy_coef_end: 0.0010
-  entropy_anneal_frac1: 0.40
-  entropy_anneal_frac2: 0.85
+  entropy_coef: 0.012
+  entropy_coef_mid: 0.0070
+  entropy_coef_end: 0.0040
+  entropy_anneal_frac1: 0.50
+  entropy_anneal_frac2: 1.00
   entropy_schedule_mode: by_switch_age  # by_switch_age | by_level
-  entropy_decay_iters_per_level: 1800
-  actor_log_std_min: -1.6
+  entropy_decay_iters_per_level: 3200
+  # On curriculum switch, temporarily boost entropy and partially lift actor std.
+  switch_entropy_boost_mult: 1.25
+  switch_entropy_boost_iters: 450
+  switch_std_recover_ratio: 0.35
+  actor_log_std_min: -0.8
   actor_log_std_max: 0.5
-  actor_log_std_init: -0.35
-  actor_lr: 0.00012
+  actor_log_std_init: -0.10
+  actor_lr: 0.00010
   critic_lr: 0.00025
-  clip_param: 0.20
+  clip_param: 0.18
   ppo_epochs: 4
   num_minibatches: 4
 

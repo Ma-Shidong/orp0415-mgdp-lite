@@ -164,8 +164,8 @@ virtual_ground: 0.2
 virtual_ceiling: 4.5
 bound_line_max_dist: 18.0
 bound_soft_penalty_enable: true
-bound_soft_margin_ratio: 0.68
-bound_soft_penalty_w: 3.0
+bound_soft_margin_ratio: 0.72
+bound_soft_penalty_w: 4.2
 
 # NeuFlow / temporal flow (smaller gap -> faster response for fast obstacles)
 flow_gap: 6
@@ -182,8 +182,8 @@ lidar_v_edge_margin_deg: 6.0
 # -----------------------------
 reward_weights:
   w_v: 0.45     # cruise-speed shaping weight (risk-speed baseline)
-  w_a: 0.010    # acceleration energy penalty weight (allow faster reactions)
-  w_j: 0.0015   # jerk penalty weight (allow quicker evasive maneuvers)
+  w_a: 0.014    # acceleration energy penalty weight (suppress acc-limit collapse)
+  w_j: 0.0025   # jerk penalty weight (avoid high-frequency aggressive bursts)
   w_h: 0.45     # height hold penalty weight (risk-gated)
   w_g: 2.0      # goal shaping weight (risk-gated)
 
@@ -218,6 +218,8 @@ terminate_on_height_high: true
 # Vel-limit penalty is applied immediately (even if you later decide to terminate)
 # Overspeed threshold = vel_limit_factor * vel_max
 vel_limit_factor: 1.05
+# Acc-limit threshold = acc_limit_factor * acc_max (slightly relaxed to reduce premature acc-limit done)
+acc_limit_factor: 1.70
 vel_limit_penalty: 6.0
 height_high_penalty: 10.0
 
@@ -241,20 +243,20 @@ risk_gate_goal: true
 risk_gate_g_min: 0.25
 
 risk_relax_enable: true
-risk_relax_eta_j: 1.0
-risk_relax_eta_a: 0.85
+risk_relax_eta_j: 0.65
+risk_relax_eta_a: 0.45
 
 # Risk-delta shaping: reward for quickly reducing risk (timely avoidance)
 risk_delta_enable: true
-risk_delta_w: 1.5
-risk_delta_clip: 0.45
+risk_delta_w: 1.8
+risk_delta_clip: 0.50
 risk_delta_rho: 0.45
 
 # Risk-conditioned speed (slow down only in high-risk zones)
 risk_speed_enable: true
-risk_speed_k: 0.65
-risk_speed_min_scale: 0.74
-risk_speed_sigma_scale: 1.25
+risk_speed_k: 0.75
+risk_speed_min_scale: 0.68
+risk_speed_sigma_scale: 1.35
 
 risk_reward_enable: true
 risk_cfg:

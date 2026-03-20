@@ -70,6 +70,10 @@ class PPOConfig:
     # - by_level: legacy behavior coupled to unlocked curriculum level.
     entropy_schedule_mode: str = "by_switch_age"
     entropy_decay_iters_per_level: int = 600
+    # Extra exploration recovery right after curriculum switch.
+    switch_entropy_boost_mult: float = 1.0
+    switch_entropy_boost_iters: int = 0
+    switch_std_recover_ratio: float = 0.0
     actor_lr: float = 1.0e-4
     critic_lr: float = 2.0e-4
     clip_param: float = 0.2

@@ -54,7 +54,7 @@ class PPOPolicy(TensorDictModuleBase):
         # Entropy regularization coefficient (exploration). Make it configurable.
         # Lower -> more stable, less random.
         self.entropy_coef = float(getattr(cfg, "entropy_coef", 0.01))
-        self.clip_param = 0.2 # 限制策略更新幅度，越大越敢于更新
+        self.clip_param = float(getattr(cfg, "clip_param", 0.2))
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
         self.gae = GAE(0.995, 0.95)
@@ -108,13 +108,12 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.actor.apply(init_)
         self.critic.apply(init_)
-        # 学习率
-        # self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=3e-4)
-        # self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
-        # self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=1.5e-4)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1.5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
+        actor_lr = float(getattr(cfg, "actor_lr", 1.5e-4))
+        critic_lr = float(getattr(cfg, "critic_lr", 3.0e-4))
+        encoder_lr = actor_lr
+        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=encoder_lr)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         
         self.value_norm = ValueNorm1(1).to(self.device)
 
@@ -426,6 +425,9 @@ def main(cfg):
     )
 
     eval_counter = 0
+    last_switch_iter_for_entropy_boost = -10**9
+    switch_entropy_boost_iters = max(0, int(getattr(cfg.algo, "switch_entropy_boost_iters", 0)))
+    switch_entropy_boost_mult = max(1.0, float(getattr(cfg.algo, "switch_entropy_boost_mult", 1.0)))
 
     def _next_eval_seed() -> Optional[int]:
         nonlocal eval_counter
@@ -440,6 +442,69 @@ def main(cfg):
             seed = random.randint(0, 2**31 - 1)
         eval_counter += 1
         return seed
+
+    def _find_actor_core_module(module: Optional[nn.Module]) -> Optional[nn.Module]:
+        """Recursively find the module that owns actor_std/log_std bounds."""
+        if module is None:
+            return None
+        if hasattr(module, "actor_std"):
+            return module
+        child = getattr(module, "module", None)
+        if isinstance(child, nn.Module):
+            found = _find_actor_core_module(child)
+            if found is not None:
+                return found
+        for sub in module.children():
+            found = _find_actor_core_module(sub)
+            if found is not None:
+                return found
+        return None
+
+    def _reset_actor_std_on_switch() -> Dict[str, float]:
+        """On curriculum switch, partially restore exploration by lifting actor log-std."""
+        out: Dict[str, float] = {}
+        try:
+            actor_core = _find_actor_core_module(getattr(policy, "actor", None))
+            if actor_core is None or not hasattr(actor_core, "actor_std"):
+                out["train/switch_std_reset_applied"] = 0.0
+                return out
+
+            raw = actor_core.actor_std.data
+            lo = float(getattr(actor_core, "log_std_min", -2.5))
+            hi = float(getattr(actor_core, "log_std_max", 0.5))
+            if hi < lo:
+                lo, hi = hi, lo
+
+            if hi > lo + 1.0e-6:
+                cur_log_std = lo + 0.5 * (torch.tanh(raw) + 1.0) * (hi - lo)
+            else:
+                cur_log_std = raw
+
+            target = float(getattr(cfg.algo, "actor_log_std_init", -0.25))
+            target = max(lo, min(hi, target))
+            tgt = torch.full_like(cur_log_std, target)
+            recover_ratio = float(getattr(cfg.algo, "switch_std_recover_ratio", 0.35))
+            recover_ratio = max(0.0, min(1.0, recover_ratio))
+            lifted_log_std = cur_log_std + recover_ratio * (tgt - cur_log_std)
+            new_log_std = torch.maximum(cur_log_std, lifted_log_std)
+
+            if hi > lo + 1.0e-6:
+                t = (2.0 * (new_log_std - lo) / (hi - lo)) - 1.0
+                t = t.clamp(-0.999, 0.999)
+                new_raw = torch.atanh(t)
+            else:
+                new_raw = new_log_std
+
+            actor_core.actor_std.data.copy_(new_raw)
+            out["train/switch_std_reset_applied"] = 1.0
+            out["train/switch_std_recover_ratio"] = float(recover_ratio)
+            out["train/switch_log_std_before"] = float(cur_log_std.mean().item())
+            out["train/switch_log_std_after"] = float(new_log_std.mean().item())
+            out["train/switch_log_std_delta"] = float((new_log_std - cur_log_std).mean().item())
+        except Exception:
+            out["train/switch_std_reset_applied"] = 0.0
+            out["train/switch_std_reset_error"] = 1.0
+        return out
 
     @torch.no_grad()
     def evaluate(
@@ -614,6 +679,15 @@ def main(cfg):
                 ent_coef = ent_start + (ent_mid - ent_start) * ((progress - f1) / max(1e-6, (f2 - f1)))
             else:
                 ent_coef = ent_mid + (ent_end - ent_mid) * ((progress - f2) / max(1e-6, (1.0 - f2)))
+            switch_age = int(i) - int(last_switch_iter_for_entropy_boost)
+            if switch_entropy_boost_iters > 0 and switch_age >= 0 and switch_age < switch_entropy_boost_iters:
+                fade = 1.0 - (float(switch_age) / float(max(1, switch_entropy_boost_iters)))
+                boost = 1.0 + (switch_entropy_boost_mult - 1.0) * fade
+                ent_coef *= boost
+                info["train/entropy_switch_boost"] = float(boost)
+                info["train/entropy_switch_age_iters"] = float(switch_age)
+            else:
+                info["train/entropy_switch_boost"] = 1.0
             policy.entropy_coef = float(ent_coef)
             info["train/entropy_coef"] = float(ent_coef)
         except Exception:
@@ -646,6 +720,9 @@ def main(cfg):
             # ✅ if switched, request level + reset to apply immediately
             if cinfo.get("curriculum/switch", 0.0) > 0.5:
                 try:
+                    info.update(_reset_actor_std_on_switch())
+                    last_switch_iter_for_entropy_boost = int(i)
+                    info["train/switch_entropy_boost_applied"] = 1.0 if switch_entropy_boost_iters > 0 else 0.0
                     base_env.request_curriculum_level(curr_mgr.level)
                     env.reset()  # apply now
                 except Exception as e:

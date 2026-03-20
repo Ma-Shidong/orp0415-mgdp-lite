@@ -1782,7 +1782,12 @@ class Env(IsaacEnv):
         vel_limit_factor = max(1.0, float(vel_limit_factor))
         vel_limit = vel_limit_factor * self.vel_max
 
-        acc_limit = 1.5 * self.acc_max
+        try:
+            acc_limit_factor = float(self.cfg.task.get("acc_limit_factor", 1.5))
+        except Exception:
+            acc_limit_factor = 1.5
+        acc_limit_factor = max(1.0, float(acc_limit_factor))
+        acc_limit = acc_limit_factor * self.acc_max
 
         height_ref = float(self.cfg.task.get("height_ref", self.fly_height))
 
