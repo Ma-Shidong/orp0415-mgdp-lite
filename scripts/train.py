@@ -58,6 +58,13 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
         self.gae = GAE(0.995, 0.95)
+        self._critic_priv_key = ("agents", "observation_central")
+        obs_keys = set(observation_spec.keys(True, True))
+        self.use_critic_priv = bool(getattr(cfg, "critic_priv_enable", True)) and (self._critic_priv_key in obs_keys)
+        self.use_critic_aux = bool(getattr(cfg, "critic_aux_enable", False))
+        self.critic_aux_w = float(getattr(cfg, "critic_aux_w", 0.0))
+        aux_idx_cfg = getattr(cfg, "critic_aux_target_idx", (0, 4, 5, 7))
+        self.critic_aux_target_idx = tuple(int(i) for i in aux_idx_cfg)
 
         fake_input = observation_spec.zero()
 
@@ -93,13 +100,39 @@ class PPOPolicy(TensorDictModuleBase):
             return_log_prob=True
         ).to(self.device)
 
-        self.critic = TensorDictModule(
-            nn.LazyLinear(1), ["_feature"], ["state_value"]
-        ).to(self.device)
+        if self.use_critic_priv:
+            self.critic = TensorDictSequential(
+                CatTensors(["_feature", self._critic_priv_key], "_critic_feature", del_keys=False),
+                TensorDictModule(
+                    nn.Sequential(make_mlp([256, 256]), nn.LazyLinear(1)),
+                    ["_critic_feature"],
+                    ["state_value"],
+                ),
+            ).to(self.device)
+        else:
+            self.critic = TensorDictModule(
+                nn.LazyLinear(1), ["_feature"], ["state_value"]
+            ).to(self.device)
+
+        if self.use_critic_aux and self.critic_aux_w > 0.0 and self.use_critic_priv:
+            aux_dim = max(1, len(self.critic_aux_target_idx))
+            self.critic_aux_head = TensorDictModule(
+                nn.Sequential(
+                    nn.LazyLinear(128),
+                    nn.ELU(),
+                    nn.LazyLinear(aux_dim),
+                ),
+                ["_feature"],
+                ["critic_aux_pred"],
+            ).to(self.device)
+        else:
+            self.critic_aux_head = None
 
         self.encoder(fake_input)
         self.actor(fake_input)
         self.critic(fake_input)
+        if self.critic_aux_head is not None:
+            self.critic_aux_head(fake_input)
 
         def init_(module):
             if isinstance(module, nn.Linear):
@@ -121,7 +154,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.encoder(tensordict)
         self.actor(tensordict)
         self.critic(tensordict)
-        tensordict.exclude("loc", "scale", "_feature", inplace=True)
+        tensordict.exclude("loc", "scale", "_feature", "_critic_feature", "critic_aux_pred", inplace=True)
         return tensordict
 
     def train_op(self, tensordict: TensorDict):
@@ -179,7 +212,24 @@ class PPOPolicy(TensorDictModuleBase):
         value_loss_original = self.critic_loss_fn(b_returns, values)
         value_loss = torch.max(value_loss_original, value_loss_clipped)
 
-        loss = policy_loss + entropy_loss + value_loss
+        aux_loss = torch.zeros((), device=self.device)
+        if self.critic_aux_head is not None and self.critic_aux_w > 0.0 and (self._critic_priv_key in tensordict.keys(True, True)):
+            aux_pred = self.critic_aux_head(tensordict)["critic_aux_pred"]
+            aux_target = tensordict[self._critic_priv_key]
+            while aux_target.ndim > aux_pred.ndim and aux_target.shape[-2] == 1:
+                aux_target = aux_target.squeeze(-2)
+            try:
+                aux_target = aux_target[..., list(self.critic_aux_target_idx)]
+            except Exception:
+                aux_target = torch.zeros_like(aux_pred)
+            if aux_target.shape != aux_pred.shape:
+                if aux_target.numel() == aux_pred.numel():
+                    aux_target = aux_target.reshape_as(aux_pred)
+                else:
+                    aux_target = torch.zeros_like(aux_pred)
+            aux_loss = F.smooth_l1_loss(aux_pred, aux_target.detach())
+
+        loss = policy_loss + entropy_loss + value_loss + (self.critic_aux_w * aux_loss)
         self.encoder_opt.zero_grad()
         self.actor_opt.zero_grad()
         self.critic_opt.zero_grad()
@@ -193,6 +243,7 @@ class PPOPolicy(TensorDictModuleBase):
         return TensorDict({
             "policy_loss": policy_loss,
             "value_loss": value_loss,
+            "critic_aux_loss": aux_loss,
             "entropy": entropy,
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,

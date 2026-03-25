@@ -10,8 +10,8 @@ headless: false  # default to headless to avoid GLX errors on servers without a 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 1_500_000_000
-max_iters: -1
+total_frames: 3_538_944_000
+max_iters: 12000
 eval_interval: 100
 save_interval: 500
 
@@ -40,6 +40,10 @@ algo:
   switch_entropy_boost_mult: 1.25
   switch_entropy_boost_iters: 450
   switch_std_recover_ratio: 0.35
+  critic_priv_enable: true
+  critic_aux_enable: true
+  critic_aux_w: 0.05
+  critic_aux_target_idx: [0, 4, 5, 7]
   actor_log_std_min: -0.8
   actor_log_std_max: 0.5
   actor_log_std_init: -0.10

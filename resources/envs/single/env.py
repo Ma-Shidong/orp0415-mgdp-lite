@@ -114,6 +114,10 @@ class Env(IsaacEnv):
         self.speed_sum = None
         self.acc_sum = None
         self.stall_count = None
+        # Critic-only privileged features (asymmetric actor-critic).
+        self.critic_privileged_enable = bool(self.cfg.task.get("critic_privileged_enable", True))
+        self.critic_privileged_ttc_horizon = float(self.cfg.task.get("critic_privileged_ttc_horizon", 5.0))
+        self.critic_privileged_dim = 15
 
 
     def _design_scene(self):
@@ -561,6 +565,8 @@ class Env(IsaacEnv):
         drone_state_dim = self.drone.state_spec.shape[-1]
         observation_dim = 9
         self.lidar_resolution = (self.lidar_h_res, self.lidar_v_res)
+        critic_priv_dim = int(self.cfg.task.get("critic_privileged_dim", getattr(self, "critic_privileged_dim", 15)))
+        self.critic_privileged_dim = critic_priv_dim
 
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -568,6 +574,7 @@ class Env(IsaacEnv):
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device),
                     "lidar": UnboundedContinuousTensorSpec((4, self.lidar_resolution[0], self.lidar_resolution[1]), device=self.device),
                 }),
+                "observation_central": UnboundedContinuousTensorSpec((critic_priv_dim,), device=self.device),
                 "intrinsics": self.drone.intrinsics_spec.to(self.device)
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
@@ -1576,8 +1583,18 @@ class Env(IsaacEnv):
         dismap_tensor = list(self.dismap_image_queue)
         dismap_image0 = torch.cat(dismap_tensor[:3], dim=1)
         dismap_image1 = torch.cat(dismap_tensor[-3:], dim=1)
-        with torch.no_grad():
-            self.dismap_flow = self.flow_est_model(dismap_image0, dismap_image1)[-1]
+        # NeuFlow inference is one of the heaviest per-step operations in the env.
+        # Allow holding the last flow for a few steps to improve rollout throughput.
+        flow_update_period = max(1, int(self.cfg.task.get("flow_update_period", 1)))
+        if not hasattr(self, "_flow_skip_counter"):
+            self._flow_skip_counter = 0
+        run_flow = (self.dismap_flow is None) or (self._flow_skip_counter <= 0) or (flow_update_period <= 1)
+        if run_flow:
+            with torch.no_grad():
+                self.dismap_flow = self.flow_est_model(dismap_image0, dismap_image1)[-1]
+            self._flow_skip_counter = max(0, flow_update_period - 1)
+        else:
+            self._flow_skip_counter -= 1
         if self.dismap_flow_queue is None:
             flow_slide_window = int(self.cfg.task.flow_slide_window)
             self.dismap_flow_queue = deque([self.dismap_flow] * flow_slide_window, maxlen=flow_slide_window)
@@ -1655,7 +1672,8 @@ class Env(IsaacEnv):
         obs = {
             "state": torch.cat([target_dir, vel_input, acc_input], dim=-1).squeeze(1),
             "lidar": self.dismap_stack
-        }         
+        }
+        obs_central = self._compute_critic_privileged_obs(target_dir, vel_fb, acc_fb)
 
         if (self._should_render(0)) & (self.cfg.task.vis_lidar):
             ray_dis = self.lidar_scan_dis.reshape(self.num_envs, self.lidar_h_res * self.lidar_v_res)
@@ -1675,6 +1693,7 @@ class Env(IsaacEnv):
                 "agents": TensorDict(
                     {
                         "observation": obs,
+                        "observation_central": obs_central,
                         "intrinsics": self.drone.intrinsics,
                     },
                     [self.num_envs],
@@ -1683,6 +1702,103 @@ class Env(IsaacEnv):
             },
             self.batch_size,
         )
+
+    def _compute_critic_privileged_obs(
+        self,
+        target_dir: torch.Tensor,
+        vel_fb: torch.Tensor,
+        acc_fb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Critic-only privileged signals (never fed to actor at deployment)."""
+        n = int(self.num_envs)
+        dev = self.device
+        dtype = self.drone_state.dtype
+        out = torch.zeros((n, self.critic_privileged_dim), device=dev, dtype=dtype)
+        if not self.critic_privileged_enable:
+            return out
+
+        rpos = self.rpos.squeeze(1) if self.rpos.ndim == 3 else self.rpos
+        goal_dir = target_dir.squeeze(1) if target_dir.ndim == 3 else target_dir
+        vel = vel_fb.squeeze(1) if vel_fb.ndim == 3 else vel_fb
+        acc = acc_fb.squeeze(1) if acc_fb.ndim == 3 else acc_fb
+        pos = self.drone_state[..., :3].squeeze(1) if self.drone_state.ndim == 3 else self.drone_state[..., :3]
+
+        vel_scale = max(1.0e-6, float(self.vel_max))
+        acc_scale = max(1.0e-6, float(self.acc_max))
+        lidar_scale = max(1.0e-6, float(self.lidar_range))
+        goal_scale = max(1.0, float(self.cfg.task.get("bound_line_max_dist", self.lidar_range)))
+        ttc_h = max(1.0e-3, float(self.critic_privileged_ttc_horizon))
+
+        goal_dist = rpos.norm(dim=-1)
+        goal_progress = (vel * goal_dir).sum(dim=-1)
+        speed = vel.norm(dim=-1)
+        acc_mag = acc.norm(dim=-1)
+        lidar_min = self.lidar_scan_dis.reshape(n, -1).amin(dim=-1) if self.lidar_scan_dis is not None else torch.full((n,), self.lidar_range, device=dev, dtype=dtype)
+
+        nearest_dist = torch.full((n,), self.lidar_range, device=dev, dtype=dtype)
+        nearest_closing = torch.zeros((n,), device=dev, dtype=dtype)
+        nearest_ttc = torch.full((n,), ttc_h, device=dev, dtype=dtype)
+        nearest_rel = torch.zeros((n, 2), device=dev, dtype=dtype)
+        nearest_rel_vel = torch.zeros((n, 2), device=dev, dtype=dtype)
+
+        active = int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))
+        active = max(0, min(active, int(getattr(self, "dynamic_obs_num", 0))))
+        if active > 0 and (self.dobs_states is not None) and (self.dobs_states.shape[0] >= active):
+            dobs_pos = self.dobs_states[:active, 0].to(device=dev, dtype=dtype)
+            dobs_vel = self.dobs_states[:active, 1].to(device=dev, dtype=dtype)
+            drone_xy = pos[:, :2]
+            drone_vxy = vel[:, :2]
+
+            rel_xy = dobs_pos.unsqueeze(0) - drone_xy.unsqueeze(1)  # [N, A, 2]
+            dist = rel_xy.norm(dim=-1)  # [N, A]
+            nearest_dist, nearest_idx = dist.min(dim=1)
+            env_idx = torch.arange(n, device=dev)
+            nearest_rel = rel_xy[env_idx, nearest_idx]
+            nearest_obs_vel = dobs_vel[nearest_idx]
+            nearest_rel_vel = nearest_obs_vel - drone_vxy
+
+            rel_dir = nearest_rel / nearest_dist.unsqueeze(-1).clamp_min(1.0e-3)
+            closing = -(nearest_rel_vel * rel_dir).sum(dim=-1)
+            nearest_closing = torch.clamp(closing, min=0.0)
+            ttc_raw = nearest_dist / nearest_closing.clamp_min(1.0e-3)
+            nearest_ttc = torch.where(
+                nearest_closing > 1.0e-3,
+                torch.clamp(ttc_raw, min=0.0, max=ttc_h),
+                torch.full_like(ttc_raw, ttc_h),
+            )
+
+        z_min = float(self.cfg.task.get("virtual_ground", self.virtual_ground))
+        z_max = float(self.cfg.task.get("virtual_ceiling", self.virtual_ceiling))
+        z_span = max(1.0e-6, z_max - z_min)
+        height_norm = ((pos[:, 2] - z_min) / z_span).clamp(0.0, 1.0)
+
+        total_dobs = max(1, int(getattr(self, "dynamic_obs_num", 1)))
+        active_ratio = torch.full((n,), float(active) / float(total_dobs), device=dev, dtype=dtype)
+        curr_level = int(getattr(self, "_curriculum_level", 0))
+        max_level = max(1, len(getattr(self, "_success_curriculum_levels", [])) - 1)
+        level_norm = torch.full((n,), float(curr_level) / float(max_level), device=dev, dtype=dtype)
+
+        out = torch.stack(
+            [
+                (goal_dist / goal_scale).clamp(0.0, 2.0),
+                (goal_progress / vel_scale).clamp(-2.0, 2.0),
+                (speed / vel_scale).clamp(0.0, 2.0),
+                (acc_mag / acc_scale).clamp(0.0, 2.0),
+                (lidar_min / lidar_scale).clamp(0.0, 1.0),
+                (nearest_dist / lidar_scale).clamp(0.0, 2.0),
+                (nearest_closing / vel_scale).clamp(0.0, 2.0),
+                (nearest_ttc / ttc_h).clamp(0.0, 1.0),
+                (nearest_rel[:, 0] / lidar_scale).clamp(-2.0, 2.0),
+                (nearest_rel[:, 1] / lidar_scale).clamp(-2.0, 2.0),
+                (nearest_rel_vel[:, 0] / vel_scale).clamp(-2.0, 2.0),
+                (nearest_rel_vel[:, 1] / vel_scale).clamp(-2.0, 2.0),
+                active_ratio,
+                height_norm,
+                level_norm,
+            ],
+            dim=-1,
+        )
+        return out
 
 
     def _compute_reward_and_done(self):

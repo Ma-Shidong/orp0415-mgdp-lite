@@ -132,7 +132,7 @@ lidar_range: 10.0
 lidar_h_res: 36
 lidar_v_res: 6
 lidar_h_sample: 3
-lidar_v_sample: 3
+lidar_v_sample: 2
 lidar_hfov: 360
 lidar_vfov: [-7., 52.]
 
@@ -170,12 +170,17 @@ bound_soft_penalty_w: 4.2
 # NeuFlow / temporal flow (smaller gap -> faster response for fast obstacles)
 flow_gap: 6
 flow_slide_window: 5
+flow_update_period: 2
 
 vis_lidar: false
 vis_dismap: false
 
 action_transform: null
 lidar_v_edge_margin_deg: 6.0
+
+# Critic privileged features (training-only): global/true obstacle cues.
+critic_privileged_enable: true
+critic_privileged_ttc_horizon: 5.0
 
 # -----------------------------
 # Goal-oriented reward settings
@@ -224,7 +229,7 @@ vel_limit_penalty: 6.0
 height_high_penalty: 10.0
 
 success_bonus: 200.0
-collision_penalty: 340.0
+collision_penalty: 390.0
 collision_include_height: true
 
 # Stronger time penalty encourages detours instead of waiting behind slow obstacles
@@ -240,7 +245,7 @@ goal_w_d: 20.0
 goal_w_theta: 0.06
 
 risk_gate_goal: true
-risk_gate_g_min: 0.25
+risk_gate_g_min: 0.23
 
 risk_relax_enable: true
 risk_relax_eta_j: 0.65
@@ -269,7 +274,7 @@ risk_cfg:
   # risk penalty soft-threshold
   alpha: 6.0
   rho0: 0.45
-  w_r: 2.4
+  w_r: 2.5
 
   # --- static/slow clearance (integrated into risk map) ---
   static_enable: true

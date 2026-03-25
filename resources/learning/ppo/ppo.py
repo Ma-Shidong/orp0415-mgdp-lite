@@ -74,6 +74,11 @@ class PPOConfig:
     switch_entropy_boost_mult: float = 1.0
     switch_entropy_boost_iters: int = 0
     switch_std_recover_ratio: float = 0.0
+    # Asymmetric critic + auxiliary supervision.
+    critic_priv_enable: bool = True
+    critic_aux_enable: bool = True
+    critic_aux_w: float = 0.05
+    critic_aux_target_idx: tuple = (0, 4, 5, 7)
     actor_lr: float = 1.0e-4
     critic_lr: float = 2.0e-4
     clip_param: float = 0.2
