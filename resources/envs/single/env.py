@@ -1316,6 +1316,7 @@ class Env(IsaacEnv):
         input_dir,
         target_dir,
         curr_rot,
+        vel_w,
     ):
         depth_stable = torch.where(
             torch.isfinite(depth_denoised),
@@ -1369,12 +1370,16 @@ class Env(IsaacEnv):
             front_gate = torch.ones_like(corridor_weight)
         corridor_risk = torch.clamp(proximity * corridor_weight * front_gate, 0.0, 1.0)
 
-        closing_speed = torch.clamp(radial_speed_mps, min=0.0)
+        vel_sensor = quat_rotate_inverse(q_yaw, vel_w)
+        ego_proj = (vel_sensor.unsqueeze(1) * dir_flat).sum(dim=-1).reshape(self.num_envs, 1, *self.lidar_resolution)
+        obstacle_radial = torch.where(radial_valid, radial_speed_mps, torch.zeros_like(radial_speed_mps))
+        closing_raw = ego_proj + obstacle_radial
+        closing_speed = torch.clamp(closing_raw, min=0.0)
         min_closing = float(self.cfg.task.get("mgdp_v2_ttc_min_closing_speed", 0.15))
         horizon = float(self.cfg.task.get("mgdp_v2_ttc_horizon", 4.0))
         tau = float(self.cfg.task.get("mgdp_v2_ttc_tau", 1.5))
         ttc = depth_motion / closing_speed.clamp_min(1.0e-6)
-        valid_ttc = valid_depth & radial_valid & (closing_speed > min_closing) & (ttc < horizon)
+        valid_ttc = valid_depth & (closing_speed > min_closing) & (ttc < horizon)
         ttc_risk = torch.exp(-ttc / max(tau, 1.0e-6))
         ttc_risk = torch.where(valid_ttc, ttc_risk, torch.zeros_like(ttc_risk))
         ttc_risk = torch.clamp(ttc_risk, 0.0, 1.0)
@@ -1863,6 +1868,7 @@ class Env(IsaacEnv):
                 input_dir=self.input_dir,
                 target_dir=target_dir,
                 curr_rot=curr_rot,
+                vel_w=vel_fb.squeeze(1),
             )
         else:
             # P2M/legacy: [depth(1), NeuFlow(2), radial(1)].

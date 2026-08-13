@@ -794,8 +794,15 @@ class Infer:
             prev_pos = self.prev_pos
             prev_rot = self.prev_rot
 
-            prev_rot_expand = prev_rot.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
-            curr_rot_expand = curr_rot.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
+            prev_yaw = quaternion_to_euler(prev_rot)[..., 2]
+            curr_yaw = quaternion_to_euler(curr_rot)[..., 2]
+            zeros_prev = torch.zeros_like(prev_yaw)
+            zeros_curr = torch.zeros_like(curr_yaw)
+            prev_rot_yaw = euler_to_quaternion(torch.stack([zeros_prev, zeros_prev, prev_yaw], dim=-1))
+            curr_rot_yaw = euler_to_quaternion(torch.stack([zeros_curr, zeros_curr, curr_yaw], dim=-1))
+
+            prev_rot_expand = prev_rot_yaw.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
+            curr_rot_expand = curr_rot_yaw.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
             prev_pos_expand = prev_pos.unsqueeze(1)
             curr_pos_expand = curr_pos.unsqueeze(1)
 
@@ -969,12 +976,17 @@ class Infer:
                 front_gate = torch.ones_like(corridor_weight)
             corridor_risk = torch.clamp(proximity * corridor_weight * front_gate, 0.0, 1.0)
 
-            closing_speed = torch.clamp(radial_speed_channel, min=0.0)
+            vel_w = drone_state[..., 3:].squeeze(1)
+            vel_sensor = quat_rotate_inverse(q_yaw, vel_w)
+            ego_proj = (vel_sensor.unsqueeze(1) * dir_flat).sum(dim=-1).reshape(1, 1, *self.lidar_resolution)
+            obstacle_radial = torch.where(radial_valid_channel, radial_speed_channel, torch.zeros_like(radial_speed_channel))
+            closing_raw = ego_proj + obstacle_radial
+            closing_speed = torch.clamp(closing_raw, min=0.0)
             min_closing = float(self.cfg.task.get("mgdp_v2_ttc_min_closing_speed", 0.15))
             horizon = float(self.cfg.task.get("mgdp_v2_ttc_horizon", 4.0))
             tau = float(self.cfg.task.get("mgdp_v2_ttc_tau", 1.5))
             ttc = lidar_scan_dis / closing_speed.clamp_min(1.0e-6)
-            valid_ttc = (lidar_scan_dis > self.lidar_radial_min_depth) & radial_valid_channel & (closing_speed > min_closing) & (ttc < horizon)
+            valid_ttc = (lidar_scan_dis > self.lidar_radial_min_depth) & (closing_speed > min_closing) & (ttc < horizon)
             ttc_risk = torch.exp(-ttc / max(tau, 1.0e-6))
             ttc_risk = torch.where(valid_ttc, ttc_risk, torch.zeros_like(ttc_risk))
             ttc_risk = torch.clamp(ttc_risk, 0.0, 1.0)

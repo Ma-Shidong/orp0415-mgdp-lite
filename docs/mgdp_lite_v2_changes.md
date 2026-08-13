@@ -113,6 +113,14 @@ python /home/csj/msd/orp0415/orp/scripts/eval_p2m_ros_batch.py \
   --device cuda:0
 ```
 
+## 2026-08-13 针对性修正
+
+本轮修正了 v2 的三个观测一致性问题：
+
+- `ch3` 的 TTC 风险不再只使用 ego-motion compensation 后的障碍物径向速度，而是使用 `无人机自身沿 ray 的 closing 分量 + 障碍物自身径向速度`。这样静态墙场景中，`ch1` 可以接近 0，但无人机主动飞向墙时 `ch3` 仍会升高。
+- `infer.py` 和训练端一样使用 yaw-only 姿态做径向 motion compensation，避免训练/推理的 LiDAR frame 语义不一致。
+- `infer_ros.py` 优先使用 PointCloud2 的 `msg.header.stamp` 计算真实 LiDAR 帧间隔；stamp 为空时退回 wall time，第一帧或时间戳异常时，障碍物自身 radial motion 按无效处理，避免除零和假大速度。
+
 ## 看哪些日志
 
 训练时除了原来的 `train/stats.flight_success`、`train/stats.done_success`、`train/stats.reward_collision`、`train/stats.done_safety`，v2 还会记录这些观测检查量：

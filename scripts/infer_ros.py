@@ -343,6 +343,9 @@ class InferROS:
         self.prev_depth_smoothed = None
         self.prev_pos = None
         self.prev_rot = None
+        self.prev_lidar_stamp = None
+        self.current_lidar_dt = None
+        self.prev_lidar_wall_time = None
         self.risk_virtual_depth = None
         self.risk_virtual_age = None
         self.last_target_acc = torch.zeros(1, 3, device=self.device)
@@ -771,6 +774,17 @@ class InferROS:
         self.lidar_scan_dis_risk = torch.minimum(lidar_scan_dis, self.risk_virtual_depth)
         return lidar_scan_dis
 
+    def _valid_lidar_dt(self):
+        dt = self.current_lidar_dt
+        if dt is None or not math.isfinite(float(dt)):
+            return None
+        dt = float(dt)
+        dt_min = float(self.cfg.task.get("ros_lidar_dt_min", 1.0e-3))
+        dt_max = float(self.cfg.task.get("ros_lidar_dt_max", 0.2))
+        if dt <= dt_min or dt > dt_max:
+            return None
+        return dt
+
     def _build_observation(self, lidar_dis: torch.Tensor, pos_w: torch.Tensor, vel_w: torch.Tensor, q_wxyz: torch.Tensor, goal_w: torch.Tensor) -> TensorDict:
         """Match env.py observation construction: lidar(4ch) + state(9)."""
         lidar_scan_dis = torch.where(
@@ -793,7 +807,8 @@ class InferROS:
         radial_channel = torch.full_like(lidar_scan_dis, self.lidar_radial_invalid_value)
         radial_speed_channel = torch.zeros_like(lidar_scan_dis)
         radial_valid_channel = torch.zeros_like(lidar_scan_dis, dtype=torch.bool)
-        if self.prev_depth_smoothed is not None and self.prev_pos is not None and self.prev_rot is not None:
+        radial_dt = self._valid_lidar_dt()
+        if radial_dt is not None and self.prev_depth_smoothed is not None and self.prev_pos is not None and self.prev_rot is not None:
             dir_flat = self.lidar_dirs.reshape(1, -1, 3)
             prev_depth_flat = self.prev_depth_smoothed.reshape(1, -1)
             curr_depth_flat = depth_smoothed.reshape(1, -1)
@@ -803,8 +818,15 @@ class InferROS:
             curr_pos = pos_w
             curr_rot = q_wxyz
 
-            prev_rot_expand = prev_rot.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
-            curr_rot_expand = curr_rot.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
+            prev_yaw = quaternion_to_euler(prev_rot)[..., 2]
+            curr_yaw = quaternion_to_euler(curr_rot)[..., 2]
+            zeros_prev = torch.zeros_like(prev_yaw)
+            zeros_curr = torch.zeros_like(curr_yaw)
+            prev_rot_yaw = euler_to_quaternion(torch.stack([zeros_prev, zeros_prev, prev_yaw], dim=-1))
+            curr_rot_yaw = euler_to_quaternion(torch.stack([zeros_curr, zeros_curr, curr_yaw], dim=-1))
+
+            prev_rot_expand = prev_rot_yaw.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
+            curr_rot_expand = curr_rot_yaw.unsqueeze(1).expand(-1, dir_flat.shape[1], -1)
             prev_pos_expand = prev_pos.unsqueeze(1)
             curr_pos_expand = curr_pos.unsqueeze(1)
 
@@ -814,9 +836,6 @@ class InferROS:
 
             pred_depth = (p_prev_curr * dir_flat).sum(-1)
             residual = curr_depth_flat - pred_depth
-            radial_dt = float(self.lidar_radial_dt)
-            if bool(self.cfg.task.get("mgdp_v2_use_effective_dt", False)):
-                radial_dt = float(self.cfg.task.get("sim_dt", self.lidar_radial_dt))
             radial_speed = -residual / max(radial_dt, 1e-6)
 
             speed_abs = radial_speed.abs()
@@ -942,12 +961,16 @@ class InferROS:
                 front_gate = torch.ones_like(corridor_weight)
             corridor_risk = torch.clamp(proximity * corridor_weight * front_gate, 0.0, 1.0)
 
-            closing_speed = torch.clamp(radial_speed_channel, min=0.0)
+            vel_sensor = quat_rotate_inverse(q_yaw, vel_w)
+            ego_proj = (vel_sensor.unsqueeze(1) * dir_flat).sum(dim=-1).reshape(1, 1, *self.lidar_resolution)
+            obstacle_radial = torch.where(radial_valid_channel, radial_speed_channel, torch.zeros_like(radial_speed_channel))
+            closing_raw = ego_proj + obstacle_radial
+            closing_speed = torch.clamp(closing_raw, min=0.0)
             min_closing = float(self.cfg.task.get("mgdp_v2_ttc_min_closing_speed", 0.15))
             horizon = float(self.cfg.task.get("mgdp_v2_ttc_horizon", 4.0))
             tau = float(self.cfg.task.get("mgdp_v2_ttc_tau", 1.5))
             ttc = lidar_scan_dis / closing_speed.clamp_min(1.0e-6)
-            valid_ttc = (lidar_scan_dis > self.lidar_radial_min_depth) & radial_valid_channel & (closing_speed > min_closing) & (ttc < horizon)
+            valid_ttc = (lidar_scan_dis > self.lidar_radial_min_depth) & (closing_speed > min_closing) & (ttc < horizon)
             ttc_risk = torch.exp(-ttc / max(tau, 1.0e-6))
             ttc_risk = torch.where(valid_ttc, ttc_risk, torch.zeros_like(ttc_risk))
             ttc_risk = torch.clamp(ttc_risk, 0.0, 1.0)
@@ -979,6 +1002,15 @@ class InferROS:
     def _pcd_cb(self, msg: PointCloud2):
         if self.odom_msg is None or self.goal_msg is None:
             return
+
+        curr_stamp = msg.header.stamp.to_sec()
+        curr_wall_time = time.time()
+        if curr_stamp > 0.0:
+            self.current_lidar_dt = None if self.prev_lidar_stamp is None else curr_stamp - self.prev_lidar_stamp
+            self.prev_lidar_stamp = curr_stamp
+        else:
+            self.current_lidar_dt = None if self.prev_lidar_wall_time is None else curr_wall_time - self.prev_lidar_wall_time
+        self.prev_lidar_wall_time = curr_wall_time
 
         p = self.odom_msg.pose.pose.position
         o = self.odom_msg.pose.pose.orientation

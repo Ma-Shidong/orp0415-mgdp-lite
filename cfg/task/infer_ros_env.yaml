@@ -18,6 +18,8 @@ mgdp_v2_ttc_horizon: 4.0
 mgdp_v2_ttc_tau: 1.5
 mgdp_v2_debug: false
 mgdp_v2_debug_every: 100
+ros_lidar_dt_min: 0.001
+ros_lidar_dt_max: 0.2
 lidar_use_height_filter: false
 lidar_radial_window: 3
 lidar_radial_min_depth: 0.1
