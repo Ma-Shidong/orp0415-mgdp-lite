@@ -1,0 +1,9 @@
+experiment:
+  phase1_throughput: p1
+
+algo:
+  train_every: 192
+
+task:
+  env:
+    num_envs: 1024

@@ -19,3 +19,9 @@ algo:
   actor_log_std_min: -2.0
   actor_log_std_max: 0.5
   actor_log_std_init: -0.5
+
+model:
+  temporal:
+    enable: false
+    type: gru
+    hidden_size: 128

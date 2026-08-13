@@ -24,6 +24,7 @@
 import datetime
 import logging
 import os
+from typing import Any
 
 import wandb
 from omegaconf import OmegaConf
@@ -41,6 +42,33 @@ def dict_flatten(x, parent_key="", sep="."):
     else:
         items[parent_key] = x
     return items
+
+
+def _cfg_get(node: Any, key: str, default=None):
+    try:
+        return node.get(key, default)
+    except Exception:
+        return getattr(node, key, default)
+
+
+def _build_wandb_settings(disable_sys: bool, init_timeout: float):
+    settings_kwargs = {}
+    if init_timeout is not None:
+        settings_kwargs["init_timeout"] = float(init_timeout)
+    if disable_sys:
+        settings_kwargs["x_disable_stats"] = True
+        settings_kwargs["x_disable_meta"] = True
+    try:
+        return wandb.Settings(**settings_kwargs)
+    except Exception:
+        settings_kwargs.pop("x_disable_meta", None)
+        try:
+            return wandb.Settings(**settings_kwargs)
+        except Exception:
+            settings_kwargs.pop("x_disable_stats", None)
+            if disable_sys:
+                settings_kwargs["_disable_stats"] = True
+            return wandb.Settings(**settings_kwargs)
 
 
 def init_wandb(cfg):
@@ -76,25 +104,27 @@ def init_wandb(cfg):
         print(f"starting a new run: {new_id}")
     # Disable W&B system metrics / metadata collection by default to reduce overhead.
     # Can be overridden via cfg.wandb.disable_system_metrics=false
-    disable_sys = True
-    try:
-        disable_sys = bool(wandb_cfg.get("disable_system_metrics", True))
-    except Exception:
-        try:
-            disable_sys = bool(getattr(wandb_cfg, "disable_system_metrics", True))
-        except Exception:
-            disable_sys = True
-    if disable_sys:
-        try:
-            kwargs["settings"] = wandb.Settings(x_disable_stats=True, x_disable_meta=True)
-        except Exception:
-            # backward-compat for older wandb
-            try:
-                kwargs["settings"] = wandb.Settings(_disable_stats=True)
-            except Exception:
-                pass
+    disable_sys = bool(_cfg_get(wandb_cfg, "disable_system_metrics", True))
+    init_timeout = float(_cfg_get(wandb_cfg, "init_timeout", 300.0))
+    fallback_mode = str(_cfg_get(wandb_cfg, "fallback_mode", "offline") or "").lower()
+    kwargs["settings"] = _build_wandb_settings(disable_sys=disable_sys, init_timeout=init_timeout)
 
-    run = wandb.init(**kwargs)
+    try:
+        run = wandb.init(**kwargs)
+    except Exception as exc:
+        logging.exception("wandb.init failed in mode=%s", kwargs.get("mode"))
+        mode = str(kwargs.get("mode", "") or "").lower()
+        if mode == "online" and fallback_mode in {"offline", "disabled"}:
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["mode"] = fallback_mode
+            logging.warning(
+                "Retrying wandb.init in fallback mode=%s after online init failure: %s",
+                fallback_mode,
+                exc,
+            )
+            run = wandb.init(**retry_kwargs)
+        else:
+            raise
     cfg_dict = dict_flatten(OmegaConf.to_container(cfg))
     run.config.update(cfg_dict, allow_val_change = kwargs["allow_val_change"])
     return run

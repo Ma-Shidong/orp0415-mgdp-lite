@@ -1,0 +1,9 @@
+experiment:
+  phase1_done_fix: d1
+
+task:
+  goal_use_planar: false
+  height_gate_min: 0.30
+  height_w_floor: 4.0
+  reward_weights:
+    w_h: 0.65

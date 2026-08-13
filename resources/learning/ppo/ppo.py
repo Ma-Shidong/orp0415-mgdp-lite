@@ -48,6 +48,8 @@ class PPOConfig:
     train_every: int = 256 # 每次 PPO 更新用多少数据
     ppo_epochs: int = 4 #同一份 rollout 数据被重复用多少次
     num_minibatches: int = 4 #16 每个 epoch 切成多少小批
+    bptt_len: int = 64
+    sequence_num_minibatches: int = 4
 
 
     # Exploration / regularization

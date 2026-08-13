@@ -4,7 +4,7 @@ defaults:
 - /base/sim_base@_here_
 
 env:
-  num_envs: 1152
+  num_envs: 1280
   max_episode_length: 2400
 
 # Seed control (-1 => random per run)
@@ -132,9 +132,25 @@ lidar_range: 10.0
 lidar_h_res: 36
 lidar_v_res: 6
 lidar_h_sample: 3
-lidar_v_sample: 2
+lidar_v_sample: 3
 lidar_hfov: 360
 lidar_vfov: [-7., 52.]
+input_mode: p2m
+mgdp_corridor_half_height: 1.0
+
+# MGDP-lite v2 observation frontend. These parameters are ignored by p2m
+# and mgdp_lite v1 modes.
+mgdp_v2_radial_speed_scale: 6.0
+mgdp_v2_use_effective_dt: true
+mgdp_v2_corridor_sigma: 1.0
+mgdp_v2_corridor_speed_adaptive: false
+mgdp_v2_corridor_speed_gain: 0.12
+mgdp_v2_corridor_forward_only: true
+mgdp_v2_ttc_min_closing_speed: 0.15
+mgdp_v2_ttc_horizon: 4.0
+mgdp_v2_ttc_tau: 1.5
+mgdp_v2_debug: false
+mgdp_v2_debug_every: 100
 
 lidar_use_height_filter: false
 lidar_radial_window: 3
@@ -160,6 +176,10 @@ bound_h: 1.0
 
 # Override env constraints
 vel_max: 7.0
+acc_max: 10.0
+# Normalized policy actions are mapped to target_acc via acc_ref.
+# Keep this below the hard health threshold first to stabilize L4 before any GRU work.
+acc_ref: 9.0
 virtual_ground: 0.2
 virtual_ceiling: 4.5
 bound_line_max_dist: 18.0
@@ -167,8 +187,8 @@ bound_soft_penalty_enable: true
 bound_soft_margin_ratio: 0.72
 bound_soft_penalty_w: 4.2
 
-# NeuFlow / temporal flow (smaller gap -> faster response for fast obstacles)
-flow_gap: 6
+# NeuFlow / temporal flow (P2M uses a longer temporal gap)
+flow_gap: 25
 flow_slide_window: 5
 flow_update_period: 2
 
@@ -185,12 +205,20 @@ critic_privileged_ttc_horizon: 5.0
 # -----------------------------
 # Goal-oriented reward settings
 # -----------------------------
+reward_mode: p2m
 reward_weights:
-  w_v: 0.45     # cruise-speed shaping weight (risk-speed baseline)
-  w_a: 0.014    # acceleration energy penalty weight (suppress acc-limit collapse)
-  w_j: 0.0025   # jerk penalty weight (avoid high-frequency aggressive bursts)
-  w_h: 0.45     # height hold penalty weight (risk-gated)
-  w_g: 2.0      # goal shaping weight (risk-gated)
+  # Official P2M reward coefficients.
+  k_v: 1.2
+  k_a: 0.6
+  k_j: 0.2
+  k_h: 0.3
+  k_g: 0.8
+  k_s: 1.0
+  k_d: 0.6
+
+p2m_beta_vel: 2.0
+p2m_beta_acc: 5.0
+p2m_beta_hei: 2.0
 
 # Cruise speed shaping parameters
 v_ref: 2.75
@@ -226,10 +254,11 @@ vel_limit_factor: 1.05
 # Acc-limit threshold = acc_limit_factor * acc_max (slightly relaxed to reduce premature acc-limit done)
 acc_limit_factor: 1.70
 vel_limit_penalty: 6.0
+height_low_penalty: 20.0
 height_high_penalty: 10.0
 
-success_bonus: 200.0
-collision_penalty: 390.0
+success_bonus: 140.0
+collision_penalty: 340.0
 collision_include_height: true
 
 # Stronger time penalty encourages detours instead of waiting behind slow obstacles
@@ -245,11 +274,11 @@ goal_w_d: 20.0
 goal_w_theta: 0.06
 
 risk_gate_goal: true
-risk_gate_g_min: 0.23
+risk_gate_g_min: 0.25
 
 risk_relax_enable: true
-risk_relax_eta_j: 0.65
-risk_relax_eta_a: 0.45
+risk_relax_eta_j: 0.35
+risk_relax_eta_a: 0.15
 
 # Risk-delta shaping: reward for quickly reducing risk (timely avoidance)
 risk_delta_enable: true
@@ -274,7 +303,7 @@ risk_cfg:
   # risk penalty soft-threshold
   alpha: 6.0
   rho0: 0.45
-  w_r: 2.5
+  w_r: 2.4
 
   # --- static/slow clearance (integrated into risk map) ---
   static_enable: true

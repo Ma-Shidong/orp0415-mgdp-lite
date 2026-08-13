@@ -1,0 +1,11 @@
+experiment:
+  phase1_throughput: p2
+
+algo:
+  train_every: 192
+
+task:
+  env:
+    num_envs: 1024
+  lidar_update_period: 2
+  flow_update_period: 3

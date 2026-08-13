@@ -48,6 +48,7 @@ class Env(IsaacEnv):
         self.vel_min = 3.5
         self.vel_max = 7.
         self.acc_max = 10.
+        self.acc_ref = self.acc_max
         self.virtual_ground = 0.5
         self.virtual_ceiling = 3.5
         self.height_bound = 0.5
@@ -60,12 +61,14 @@ class Env(IsaacEnv):
                 self.vel_min = float(task_cfg.get("vel_min", self.vel_min))
                 self.vel_max = float(task_cfg.get("vel_max", self.vel_max))
                 self.acc_max = float(task_cfg.get("acc_max", self.acc_max))
+                self.acc_ref = float(task_cfg.get("acc_ref", self.acc_max))
                 self.virtual_ground = float(task_cfg.get("virtual_ground", self.virtual_ground))
                 self.virtual_ceiling = float(task_cfg.get("virtual_ceiling", self.virtual_ceiling))
                 self.height_bound = float(task_cfg.get("height_bound", self.height_bound))
         except Exception:
             # keep defaults
             pass
+        self.acc_min = -self.acc_ref
 
         # derived
 
@@ -98,6 +101,15 @@ class Env(IsaacEnv):
         self.radial_valid_ratio = None
         self.radial_abs_mean = None
         self.flow_abs_mean = None
+        self.obs_ch0_mean = None
+        self.obs_ch0_max = None
+        self.obs_ch1_abs_mean = None
+        self.obs_ch1_pos_ratio = None
+        self.obs_ch1_neg_ratio = None
+        self.obs_ch2_mean = None
+        self.obs_ch2_max = None
+        self.obs_ch3_mean = None
+        self.obs_ch3_max = None
 
         self.risk_virtual_depth = None
         self.risk_virtual_age = None
@@ -111,6 +123,7 @@ class Env(IsaacEnv):
         self.radial_channel = None  # cached [N,1,H,W] normalized radial speed for risk reward
         self.trace_prob = None
         self.virtual_x_bound = None
+        self.reward_dobs_max = None
         self.speed_sum = None
         self.acc_sum = None
         self.stall_count = None
@@ -602,15 +615,41 @@ class Env(IsaacEnv):
             "reward_jerk": UnboundedContinuousTensorSpec(1),
             "reward_height": UnboundedContinuousTensorSpec(1),
             "reward_goal": UnboundedContinuousTensorSpec(1),
+            "reward_safety": UnboundedContinuousTensorSpec(1),
+            "reward_dobs": UnboundedContinuousTensorSpec(1),
             "reward_risk": UnboundedContinuousTensorSpec(1),
             "reward_risk_delta": UnboundedContinuousTensorSpec(1),
             "reward_collision": UnboundedContinuousTensorSpec(1),
             "reward_bound": UnboundedContinuousTensorSpec(1),
+            "reward_velocity_weighted": UnboundedContinuousTensorSpec(1),
+            "reward_acceleration_weighted": UnboundedContinuousTensorSpec(1),
+            "reward_jerk_weighted": UnboundedContinuousTensorSpec(1),
+            "reward_height_weighted": UnboundedContinuousTensorSpec(1),
+            "reward_goal_weighted": UnboundedContinuousTensorSpec(1),
+            "reward_risk_weighted": UnboundedContinuousTensorSpec(1),
+            "reward_risk_delta_weighted": UnboundedContinuousTensorSpec(1),
+            "action_abs_mean": UnboundedContinuousTensorSpec(1),
+            "action_abs_max": UnboundedContinuousTensorSpec(1),
+            "target_acc_abs_mean": UnboundedContinuousTensorSpec(1),
+            "target_acc_abs_max": UnboundedContinuousTensorSpec(1),
+            "target_acc_clip_ratio": UnboundedContinuousTensorSpec(1),
+            "control_cmd_abs_mean": UnboundedContinuousTensorSpec(1),
+            "control_cmd_abs_max": UnboundedContinuousTensorSpec(1),
+            "control_cmd_clip_ratio": UnboundedContinuousTensorSpec(1),
             "risk_smax": UnboundedContinuousTensorSpec(1),
             "goal_gate": UnboundedContinuousTensorSpec(1),
             "radial_valid_ratio": UnboundedContinuousTensorSpec(1),
             "radial_abs_mean": UnboundedContinuousTensorSpec(1),
             "flow_abs_mean": UnboundedContinuousTensorSpec(1),
+            "obs_ch0_mean": UnboundedContinuousTensorSpec(1),
+            "obs_ch0_max": UnboundedContinuousTensorSpec(1),
+            "obs_ch1_abs_mean": UnboundedContinuousTensorSpec(1),
+            "obs_ch1_pos_ratio": UnboundedContinuousTensorSpec(1),
+            "obs_ch1_neg_ratio": UnboundedContinuousTensorSpec(1),
+            "obs_ch2_mean": UnboundedContinuousTensorSpec(1),
+            "obs_ch2_max": UnboundedContinuousTensorSpec(1),
+            "obs_ch3_mean": UnboundedContinuousTensorSpec(1),
+            "obs_ch3_max": UnboundedContinuousTensorSpec(1),
             "plan_success": UnboundedContinuousTensorSpec(1),
             "flight_success": UnboundedContinuousTensorSpec(1),
 
@@ -1022,6 +1061,8 @@ class Env(IsaacEnv):
         )
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.stats[env_ids] = 0.
+        if self.reward_dobs_max is not None:
+            self.reward_dobs_max[env_ids] = float("-inf")
         # --- IMPORTANT: clear per-episode sensor/history states for the reset envs.
         # If not cleared, "risk depth decay" + radial estimation can carry stale values across resets,
         # causing immediate unsafe/NaN and repeated resets.
@@ -1108,7 +1149,7 @@ class Env(IsaacEnv):
     def _pre_sim_step(self, tensordict: TensorDictBase):
         # defensive: ensure acc_min exists (older configs / patches)
         if not hasattr(self, 'acc_min'):
-            self.acc_min = -self.acc_max
+            self.acc_min = -self.acc_ref
         # cache drone state once per step to avoid repeated sim queries
         drone_state_pre = self.drone.get_state(env_frame=False)
         drone_pos_xy = drone_state_pre[..., :2]
@@ -1207,15 +1248,33 @@ class Env(IsaacEnv):
             else:
                 self.set_wall_state[..., :3] = 1.0e6
             self.wall.write_object_link_pose_to_sim(self.set_wall_state[..., :7])
-        # P2M-style action mapping: use raw policy action directly as target_acc input (no scaling/clamp).
-        raw_action = tensordict[("agents", "action")]  # shape: [num_envs, 3]
+        # Policy outputs normalized actions in roughly [-1, 1]. Match training to inference:
+        # clamp first, then scale into a bounded target acceleration command.
+        raw_action = tensordict[("agents", "action")]
         raw_action = torch.nan_to_num(raw_action, nan=0.0, posinf=0.0, neginf=0.0)
-        target_acc = raw_action  # P2M behavior: no scaling
-        # keep both if you need debug/reward
+        raw_action = torch.clamp(raw_action, -1.0, 1.0)
+        target_acc = torch.clamp(raw_action * self.acc_ref, -self.acc_ref, self.acc_ref)
+
+        raw_action_flat = raw_action.reshape(self.num_envs, -1)
+        target_acc_flat = target_acc.reshape(self.num_envs, -1)
+        self.stats["action_abs_mean"].copy_(raw_action_flat.abs().mean(dim=-1, keepdim=True))
+        self.stats["action_abs_max"].copy_(raw_action_flat.abs().amax(dim=-1, keepdim=True))
+        self.stats["target_acc_abs_mean"].copy_(target_acc_flat.abs().mean(dim=-1, keepdim=True))
+        self.stats["target_acc_abs_max"].copy_(target_acc_flat.abs().amax(dim=-1, keepdim=True))
+        clip_threshold = max(float(self.acc_ref) * 0.98, 1.0e-6)
+        self.stats["target_acc_clip_ratio"].copy_(
+            (target_acc_flat.abs() >= clip_threshold).float().mean(dim=-1, keepdim=True)
+        )
         self.actions = target_acc
 
         ego_drone_state = drone_state_pre[..., :13].squeeze(0)
         unit_thrust = self.controller(ego_drone_state, target_acc.unsqueeze(1), None, False)
+        unit_thrust_flat = unit_thrust.reshape(self.num_envs, -1)
+        self.stats["control_cmd_abs_mean"].copy_(unit_thrust_flat.abs().mean(dim=-1, keepdim=True))
+        self.stats["control_cmd_abs_max"].copy_(unit_thrust_flat.abs().amax(dim=-1, keepdim=True))
+        self.stats["control_cmd_clip_ratio"].copy_(
+            (unit_thrust_flat.abs() > 1.0).float().mean(dim=-1, keepdim=True)
+        )
         self.effort = self.drone.apply_action(unit_thrust)
 
 
@@ -1237,6 +1296,105 @@ class Env(IsaacEnv):
             if (self._lidar_update_counter % period) == 0:
                 self.lidar.update(self.dt * float(period))
 
+    def _effective_radial_dt(self):
+        if bool(self.cfg.task.get("mgdp_v2_use_effective_dt", False)):
+            try:
+                period = max(1, int(self.cfg.task.get("lidar_update_period", 1)))
+            except Exception:
+                period = 1
+            return float(self.dt) * float(period)
+        return float(self.lidar_radial_dt)
+
+    def _build_mgdp_lite_v2_observation(
+        self,
+        *,
+        scan_normalized,
+        depth_denoised,
+        lidar_scan_dis,
+        radial_speed_mps,
+        radial_valid,
+        input_dir,
+        target_dir,
+        curr_rot,
+    ):
+        depth_stable = torch.where(
+            torch.isfinite(depth_denoised),
+            depth_denoised.clamp_max(self.lidar_range),
+            torch.full_like(depth_denoised, self.lidar_range),
+        )
+        depth_motion = torch.where(
+            torch.isfinite(lidar_scan_dis),
+            lidar_scan_dis.clamp_max(self.lidar_range),
+            torch.full_like(lidar_scan_dis, self.lidar_range),
+        )
+        valid_depth = (
+            torch.isfinite(lidar_scan_dis)
+            & (lidar_scan_dis > self.lidar_radial_min_depth)
+            & (lidar_scan_dis <= self.lidar_range)
+        )
+
+        proximity = torch.clamp(
+            torch.nan_to_num((self.lidar_range - depth_stable) / max(self.lidar_range, 1e-6), nan=0.0),
+            0.0,
+            1.0,
+        )
+
+        speed_scale = float(self.cfg.task.get("mgdp_v2_radial_speed_scale", 6.0))
+        radial_signed = torch.clamp(radial_speed_mps / max(speed_scale, 1e-6), -1.0, 1.0)
+        radial_signed = torch.where(radial_valid, radial_signed, torch.zeros_like(radial_signed))
+
+        dir_flat = input_dir.reshape(self.num_envs, -1, 3)
+        depth_flat = depth_stable.reshape(self.num_envs, -1)
+        p_hit = dir_flat * depth_flat.unsqueeze(-1)
+
+        target_vec = target_dir.squeeze(1)
+        yaw = quaternion_to_euler(curr_rot)[..., 2]
+        zeros = torch.zeros_like(yaw)
+        q_yaw = euler_to_quaternion(torch.stack([zeros, zeros, yaw], dim=-1))
+        target_sensor = quat_rotate_inverse(q_yaw, target_vec)
+        target_sensor = target_sensor / target_sensor.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+        s = (p_hit * target_sensor.unsqueeze(1)).sum(dim=-1)
+        p_perp = p_hit - s.unsqueeze(-1) * target_sensor.unsqueeze(1)
+        d_perp = p_perp.norm(dim=-1).reshape(self.num_envs, 1, *self.lidar_resolution)
+        sigma = float(self.cfg.task.get("mgdp_v2_corridor_sigma", 1.0))
+        if bool(self.cfg.task.get("mgdp_v2_corridor_speed_adaptive", False)):
+            speed = self.drone_state[..., 7:10].squeeze(1).norm(dim=-1).view(self.num_envs, 1, 1, 1)
+            sigma = sigma + float(self.cfg.task.get("mgdp_v2_corridor_speed_gain", 0.12)) * speed
+        sigma_t = torch.as_tensor(sigma, device=self.device, dtype=d_perp.dtype).clamp_min(1.0e-6)
+        corridor_weight = torch.exp(-0.5 * (d_perp / sigma_t) ** 2)
+        if bool(self.cfg.task.get("mgdp_v2_corridor_forward_only", True)):
+            front_gate = (s.reshape(self.num_envs, 1, *self.lidar_resolution) > 0.0).float()
+        else:
+            front_gate = torch.ones_like(corridor_weight)
+        corridor_risk = torch.clamp(proximity * corridor_weight * front_gate, 0.0, 1.0)
+
+        closing_speed = torch.clamp(radial_speed_mps, min=0.0)
+        min_closing = float(self.cfg.task.get("mgdp_v2_ttc_min_closing_speed", 0.15))
+        horizon = float(self.cfg.task.get("mgdp_v2_ttc_horizon", 4.0))
+        tau = float(self.cfg.task.get("mgdp_v2_ttc_tau", 1.5))
+        ttc = depth_motion / closing_speed.clamp_min(1.0e-6)
+        valid_ttc = valid_depth & radial_valid & (closing_speed > min_closing) & (ttc < horizon)
+        ttc_risk = torch.exp(-ttc / max(tau, 1.0e-6))
+        ttc_risk = torch.where(valid_ttc, ttc_risk, torch.zeros_like(ttc_risk))
+        ttc_risk = torch.clamp(ttc_risk, 0.0, 1.0)
+
+        dismap_stack = torch.cat([proximity, radial_signed, corridor_risk, ttc_risk], dim=1)
+
+        with torch.no_grad():
+            flat = dismap_stack.view(self.num_envs, 4, -1)
+            self.obs_ch0_mean = flat[:, 0].mean(dim=1, keepdim=True)
+            self.obs_ch0_max = flat[:, 0].max(dim=1, keepdim=True).values
+            self.obs_ch1_abs_mean = flat[:, 1].abs().mean(dim=1, keepdim=True)
+            self.obs_ch1_pos_ratio = (flat[:, 1] > 1.0e-4).float().mean(dim=1, keepdim=True)
+            self.obs_ch1_neg_ratio = (flat[:, 1] < -1.0e-4).float().mean(dim=1, keepdim=True)
+            self.obs_ch2_mean = flat[:, 2].mean(dim=1, keepdim=True)
+            self.obs_ch2_max = flat[:, 2].max(dim=1, keepdim=True).values
+            self.obs_ch3_mean = flat[:, 3].mean(dim=1, keepdim=True)
+            self.obs_ch3_max = flat[:, 3].max(dim=1, keepdim=True).values
+
+        return dismap_stack
+
     def _compute_state_and_obs(self):
         # Keep locals defined to avoid UnboundLocalError in optional branches / debug.
         dismap_image0 = None
@@ -1250,6 +1408,7 @@ class Env(IsaacEnv):
 
         self.drone_state = self.drone.get_state(env_frame=False)
         self.rpos = self.target_pos - self.drone_state[..., :3]
+        curr_rot = self.drone_state[..., 3:7].squeeze(1)
 
         if (self.ray_hits_dir is None) & (self.input_dir is None):
             self.ray_hits_dir = env_utils.compute_rayhitsdir(self.device, self.num_envs, self.lidar_hfov, self.lidar_vfov,
@@ -1449,7 +1608,7 @@ class Env(IsaacEnv):
             acc_fb = self.actions.unsqueeze(1)
         else:
             acc_fb = torch.zeros_like(vel_fb)
-        acc_input = acc_fb/self.acc_max
+        acc_input = acc_fb / max(self.acc_ref, 1.0e-6)
 
         if self.depth_image_queue is None:
             window = max(1, self.lidar_radial_window)
@@ -1463,9 +1622,13 @@ class Env(IsaacEnv):
             for _frame in self.depth_image_queue:
                 _frame[temporal_reset_ids] = curr_depth[temporal_reset_ids]
 
-        depth_smoothed = torch.mean(torch.stack(list(self.depth_image_queue)), dim=0)
+        depth_stack = torch.stack(list(self.depth_image_queue))
+        depth_smoothed = torch.mean(depth_stack, dim=0)
+        depth_denoised = torch.median(depth_stack, dim=0).values
 
         radial_channel = torch.full_like(self.lidar_scan_dis, self.lidar_radial_invalid_value)
+        radial_speed_channel = torch.zeros_like(self.lidar_scan_dis)
+        radial_valid_channel = torch.zeros_like(self.lidar_scan_dis, dtype=torch.bool)
         if (self.prev_depth_smoothed is not None) and (self.prev_pos is not None) and (self.prev_rot is not None):
             dir_flat = self.input_dir.reshape(self.num_envs, -1, 3)
             prev_depth_flat = self.prev_depth_smoothed.reshape(self.num_envs, -1)
@@ -1474,8 +1637,6 @@ class Env(IsaacEnv):
             prev_pos = self.prev_pos
             prev_rot = self.prev_rot
             curr_pos = self.drone_state[..., :3].squeeze(1)
-            curr_rot = self.drone_state[..., 3:7].squeeze(1)
-
             # RayCaster is configured with attach_yaw_only=True, and self.input_dir is generated in the
             # sensor (yaw-only) frame. Use yaw-only quaternions for motion compensation; using full
             # body quaternion here introduces a frame mismatch when roll/pitch is non-zero.
@@ -1498,7 +1659,7 @@ class Env(IsaacEnv):
             pred_depth = (p_prev_curr * dir_flat).sum(-1)
             residual = curr_depth_flat - pred_depth
             # 保留靠近为正的语义，突出障碍物接近的危险性
-            radial_speed = - residual / max(self.lidar_radial_dt, 1e-6)
+            radial_speed = - residual / max(self._effective_radial_dt(), 1e-6)
 
             speed_abs = radial_speed.abs()
             valid = (
@@ -1517,6 +1678,10 @@ class Env(IsaacEnv):
                 torch.full_like(radial_norm, self.lidar_radial_invalid_value),
             )
             radial_channel = radial_flat.reshape(self.num_envs, 1, *self.lidar_resolution)
+            radial_speed_channel = torch.where(valid, radial_speed, torch.zeros_like(radial_speed)).reshape(
+                self.num_envs, 1, *self.lidar_resolution
+            )
+            radial_valid_channel = valid.reshape(self.num_envs, 1, *self.lidar_resolution)
 
         # Apply per-env radial baseline validity: envs reset this step must output invalid radial.
         if self._radial_prev_valid is not None:
@@ -1526,6 +1691,8 @@ class Env(IsaacEnv):
                 torch.full_like(radial_channel, self.lidar_radial_invalid_value),
                 radial_channel,
             )
+            radial_speed_channel = torch.where(invalid_env, torch.zeros_like(radial_speed_channel), radial_speed_channel)
+            radial_valid_channel = torch.where(invalid_env, torch.zeros_like(radial_valid_channel), radial_valid_channel)
 
         self.prev_depth_smoothed = depth_smoothed
         self.prev_pos = self.drone_state[..., :3].squeeze(1)
@@ -1537,110 +1704,118 @@ class Env(IsaacEnv):
         elif temporal_reset_ids is not None:
             self._radial_prev_valid[temporal_reset_ids] = True
 
-        # --- NeuFlow init (ONLY ONCE) ---
-        if self.dismap_flow_size is None:
-            self.dismap_flow_size = (96, 16)  # (H, W)
+        input_mode = str(self.cfg.task.get("input_mode", "p2m")).lower()
+        if input_mode in ("mgdp", "mgdp_lite", "mgdp_lite_v2"):
+            flow_zoom = torch.zeros((self.num_envs, 2, *self.lidar_resolution), device=self.device, dtype=self.lidar_scan_dis.dtype)
+            flow_scaled = flow_zoom
+            self.dismap_flow_zoom = flow_zoom
+        else:
+            # --- NeuFlow init (ONLY ONCE) ---
+            if self.dismap_flow_size is None:
+                self.dismap_flow_size = (96, 16)  # (H, W)
 
-        if self.flow_est_model is None:
-            self.flow_est_model = init_neuflow(
-                self.num_envs,
-                self.dismap_flow_size,
-                device=self.device,  # 确保和环境 device 一致，比如 cuda:1
+            if self.flow_est_model is None:
+                self.flow_est_model = init_neuflow(
+                    self.num_envs,
+                    self.dismap_flow_size,
+                    device=self.device,  # 确保和环境 device 一致，比如 cuda:1
+                )
+                # Print the model device only once when debugging.
+                if self.cfg.task.get("debug_flow", False) and not getattr(self, "_dbg_flow_printed", False):
+                    p = next(self.flow_est_model.parameters())
+                    print("[DEBUG] flow model param device =", p.device)
+                    self._dbg_flow_printed = True
+
+            lidar_dis_for_flow = torch.where(
+                torch.isfinite(lidar_dis),
+                lidar_dis,
+                torch.full_like(lidar_dis, self.lidar_range),
             )
-            # Print the model device only once when debugging.
-            if self.cfg.task.get("debug_flow", False) and not getattr(self, "_dbg_flow_printed", False):
-                p = next(self.flow_est_model.parameters())
-                print("[DEBUG] flow model param device =", p.device)
-                self._dbg_flow_printed = True
+            self.scan4flow = (
+                self.lidar_range - lidar_dis_for_flow.unsqueeze(1)).reshape(
+                    self.num_envs, 1,
+                    self.lidar_h_res * self.lidar_h_sample,
+                    self.lidar_v_res * self.lidar_v_sample
+                ) / self.lidar_range
+            scan4flow_scaled = torch.nn.functional.interpolate(self.scan4flow.half() * 255.,
+                                                                self.dismap_flow_size,
+                                                                mode='bilinear',
+                                                                align_corners=False)
+            if self.dismap_image_queue is None:
+                self.dismap_image_queue = deque([scan4flow_scaled] * int(self.cfg.task.flow_gap + 3),
+                                                maxlen=int(self.cfg.task.flow_gap + 3))
+            else:
+                self.dismap_image_queue.append(scan4flow_scaled)
 
-        lidar_dis_for_flow = torch.where(
-            torch.isfinite(lidar_dis),
-            lidar_dis,
-            torch.full_like(lidar_dis, self.lidar_range),
-        )
-        self.scan4flow = (
-            self.lidar_range - lidar_dis_for_flow.unsqueeze(1)).reshape(
-                self.num_envs, 1,
-                self.lidar_h_res * self.lidar_h_sample,
-                self.lidar_v_res * self.lidar_v_sample
-            ) / self.lidar_range
-        scan4flow_scaled = torch.nn.functional.interpolate(self.scan4flow.half() * 255.,
-                                                            self.dismap_flow_size,
-                                                            mode='bilinear',
-                                                            align_corners=False)
-        if self.dismap_image_queue is None:
-            self.dismap_image_queue = deque([scan4flow_scaled] * int(self.cfg.task.flow_gap + 3),
-                                            maxlen=int(self.cfg.task.flow_gap + 3))
-        else:
-            self.dismap_image_queue.append(scan4flow_scaled)
+            # Patch flow-image history for envs that were reset (avoid mixing across episodes).
+            if temporal_reset_ids is not None:
+                curr_img = scan4flow_scaled
+                for _img in self.dismap_image_queue:
+                    _img[temporal_reset_ids] = curr_img[temporal_reset_ids]
 
-        # Patch flow-image history for envs that were reset (avoid mixing across episodes).
-        if temporal_reset_ids is not None:
-            curr_img = scan4flow_scaled
-            for _img in self.dismap_image_queue:
-                _img[temporal_reset_ids] = curr_img[temporal_reset_ids]
+            dismap_tensor = list(self.dismap_image_queue)
+            dismap_image0 = torch.cat(dismap_tensor[:3], dim=1)
+            dismap_image1 = torch.cat(dismap_tensor[-3:], dim=1)
+            # NeuFlow inference is one of the heaviest per-step operations in the env.
+            # Allow holding the last flow for a few steps to improve rollout throughput.
+            flow_update_period = max(1, int(self.cfg.task.get("flow_update_period", 1)))
+            if not hasattr(self, "_flow_skip_counter"):
+                self._flow_skip_counter = 0
+            run_flow = (self.dismap_flow is None) or (self._flow_skip_counter <= 0) or (flow_update_period <= 1)
+            if run_flow:
+                with torch.no_grad():
+                    self.dismap_flow = self.flow_est_model(dismap_image0, dismap_image1)[-1]
+                self._flow_skip_counter = max(0, flow_update_period - 1)
+            else:
+                self._flow_skip_counter -= 1
+            if self.dismap_flow_queue is None:
+                flow_slide_window = int(self.cfg.task.flow_slide_window)
+                self.dismap_flow_queue = deque([self.dismap_flow] * flow_slide_window, maxlen=flow_slide_window)
+            else:
+                self.dismap_flow_queue.append(self.dismap_flow)
 
-        dismap_tensor = list(self.dismap_image_queue)
-        dismap_image0 = torch.cat(dismap_tensor[:3], dim=1)
-        dismap_image1 = torch.cat(dismap_tensor[-3:], dim=1)
-        # NeuFlow inference is one of the heaviest per-step operations in the env.
-        # Allow holding the last flow for a few steps to improve rollout throughput.
-        flow_update_period = max(1, int(self.cfg.task.get("flow_update_period", 1)))
-        if not hasattr(self, "_flow_skip_counter"):
-            self._flow_skip_counter = 0
-        run_flow = (self.dismap_flow is None) or (self._flow_skip_counter <= 0) or (flow_update_period <= 1)
-        if run_flow:
-            with torch.no_grad():
-                self.dismap_flow = self.flow_est_model(dismap_image0, dismap_image1)[-1]
-            self._flow_skip_counter = max(0, flow_update_period - 1)
-        else:
-            self._flow_skip_counter -= 1
-        if self.dismap_flow_queue is None:
-            flow_slide_window = int(self.cfg.task.flow_slide_window)
-            self.dismap_flow_queue = deque([self.dismap_flow] * flow_slide_window, maxlen=flow_slide_window)
-        else:
-            self.dismap_flow_queue.append(self.dismap_flow)
+            # Patch flow history for envs that were reset (avoid mixing across episodes).
+            if temporal_reset_ids is not None:
+                curr_flow = self.dismap_flow
+                for _f in self.dismap_flow_queue:
+                    _f[temporal_reset_ids] = curr_flow[temporal_reset_ids]
 
-        # Patch flow history for envs that were reset (avoid mixing across episodes).
-        if temporal_reset_ids is not None:
-            curr_flow = self.dismap_flow
-            for _f in self.dismap_flow_queue:
-                _f[temporal_reset_ids] = curr_flow[temporal_reset_ids]
-
-        self.dismap_flow_mean = torch.mean(torch.stack(list(self.dismap_flow_queue)), dim=0)
-        self.dismap_flow_zoom = torch.nn.functional.interpolate(self.dismap_flow_mean.float(),
-                                                                  self.lidar_resolution,
-                                                                  mode='bilinear',
-                                                                  align_corners=False)
+            self.dismap_flow_mean = torch.mean(torch.stack(list(self.dismap_flow_queue)), dim=0)
+            self.dismap_flow_zoom = torch.nn.functional.interpolate(self.dismap_flow_mean.float(),
+                                                                    self.lidar_resolution,
+                                                                    mode='bilinear',
+                                                                    align_corners=False)
+            # ---- optical flow channels: clamp to [-1, 1] to stabilize PPO
+            flow_zoom = torch.nan_to_num(self.dismap_flow_zoom.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            flow_scaled = torch.cat(
+                [
+                    (flow_zoom[:, 0:1, :, :] / 3.6),
+                    (flow_zoom[:, 1:2, :, :] / 0.6),
+                ],
+                dim=1,
+            )
+            flow_scaled = torch.clamp(flow_scaled, -1.0, 1.0)
         # ---- depth (sector/scan) channel: [0, 1]
         scan_normalized = self.lidar_scan / max(self.lidar_range, 1e-6)
         scan_normalized = torch.nan_to_num(scan_normalized, nan=1.0, posinf=1.0, neginf=1.0)
         scan_normalized = torch.clamp(scan_normalized, 0.0, 1.0)
 
-        # ---- optical flow channels: clamp to [-1, 1] to stabilize PPO
-        flow_zoom = torch.nan_to_num(self.dismap_flow_zoom.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        flow_scaled = torch.cat(
-            [
-                (flow_zoom[:, 0:1, :, :] / 3.6),
-                (flow_zoom[:, 1:2, :, :] / 0.6),
-            ],
-            dim=1,
-        )
-        flow_scaled = torch.clamp(flow_scaled, -1.0, 1.0)
-
         # ---- radial residual channel: already normalized, just sanitize
         radial_channel = torch.nan_to_num(radial_channel, nan=self.lidar_radial_invalid_value,
                                         posinf=self.lidar_radial_invalid_value, neginf=self.lidar_radial_invalid_value)
         radial_channel = torch.clamp(radial_channel, -1.0, 1.0)
+        p2m_radial_channel = radial_channel
+        if input_mode == "p2m":
+            p2m_radial_channel = torch.zeros_like(radial_channel)
 
         # cache radial channel for risk reward
-        self.radial_channel = radial_channel
+        self.radial_channel = p2m_radial_channel
 
         # --- Temporal observation diagnostics (for logging / sanity-check) ---
         # These are lightweight per-env scalars to verify that flow / radial signals
         # are actually non-trivial after vectorized resets.
         with torch.no_grad():
-            radial_flat = radial_channel.view(self.num_envs, -1)
+            radial_flat = p2m_radial_channel.view(self.num_envs, -1)
             valid = radial_flat != float(self.lidar_radial_invalid_value)
             self.radial_valid_ratio = valid.float().mean(dim=1, keepdim=True)
             denom = valid.sum(dim=1, keepdim=True).clamp(min=1)
@@ -1656,12 +1831,44 @@ class Env(IsaacEnv):
             self._temporal_reset_mask[temporal_reset_ids] = False
         self._temporal_reset_pending = False
 
-        # ---- 4-channel perception: [depth(1), flow(2), radial(1)]
-        self.dismap_stack = torch.cat([scan_normalized, flow_scaled, radial_channel], dim=1)
+        if input_mode in ("mgdp", "mgdp_lite"):
+            denoised_scan = self.lidar_range - depth_denoised
+            denoised_scan = torch.clamp(
+                torch.nan_to_num(denoised_scan / max(self.lidar_range, 1e-6), nan=0.0, posinf=1.0, neginf=0.0),
+                0.0,
+                1.0,
+            )
+
+            dir_z = self.input_dir[..., 2].reshape(self.num_envs, 1, *self.lidar_resolution)
+            pos_z = self.drone_state[..., 2].reshape(self.num_envs, 1, 1, 1)
+            target_z = self.target_pos[..., 2].reshape(self.num_envs, 1, 1, 1)
+            hit_z = pos_z + dir_z * depth_denoised
+            corridor_half_height = float(self.cfg.task.get("mgdp_corridor_half_height", 1.0))
+            height_risk = 1.0 - torch.clamp((hit_z - target_z).abs() / max(corridor_half_height, 1e-6), 0.0, 1.0)
+            corridor_risk = torch.clamp(height_risk * denoised_scan, 0.0, 1.0)
+
+            approach_risk = torch.clamp(radial_channel, 0.0, 1.0)
+            ttc_risk = torch.clamp(approach_risk * denoised_scan, 0.0, 1.0)
+
+            # MGDP-lite: four interpretable [0, 1] risk maps.
+            # [current proximity, denoised proximity, flight-corridor risk, dynamic/TTC risk]
+            self.dismap_stack = torch.cat([scan_normalized, denoised_scan, corridor_risk, ttc_risk], dim=1)
+        elif input_mode == "mgdp_lite_v2":
+            self.dismap_stack = self._build_mgdp_lite_v2_observation(
+                scan_normalized=scan_normalized,
+                depth_denoised=depth_denoised,
+                lidar_scan_dis=self.lidar_scan_dis,
+                radial_speed_mps=radial_speed_channel,
+                radial_valid=radial_valid_channel,
+                input_dir=self.input_dir,
+                target_dir=target_dir,
+                curr_rot=curr_rot,
+            )
+        else:
+            # P2M/legacy: [depth(1), NeuFlow(2), radial(1)].
+            self.dismap_stack = torch.cat([scan_normalized, flow_scaled, p2m_radial_channel], dim=1)
         # debug shapes (enable only when needed)
         assert scan_normalized.shape[1] == 1
-        assert flow_scaled.shape[1] == 2
-        assert radial_channel.shape[1] == 1
         assert self.dismap_stack.shape[1] == 4, f"dismap_stack channels={self.dismap_stack.shape}"
         # assert torch.isfinite(self.dismap_stack).all(), "dismap_stack contains NaN/Inf"
         if self.cfg.task.get("debug_checks", False):
@@ -1724,7 +1931,7 @@ class Env(IsaacEnv):
         pos = self.drone_state[..., :3].squeeze(1) if self.drone_state.ndim == 3 else self.drone_state[..., :3]
 
         vel_scale = max(1.0e-6, float(self.vel_max))
-        acc_scale = max(1.0e-6, float(self.acc_max))
+        acc_scale = max(1.0e-6, float(self.acc_ref))
         lidar_scale = max(1.0e-6, float(self.lidar_range))
         goal_scale = max(1.0, float(self.cfg.task.get("bound_line_max_dist", self.lidar_range)))
         ttc_h = max(1.0e-3, float(self.critic_privileged_ttc_horizon))
@@ -1907,147 +2114,198 @@ class Env(IsaacEnv):
 
         height_ref = float(self.cfg.task.get("height_ref", self.fly_height))
 
-        reward_acc, reward_jerk = self._compute_state_reward(
-            acc, self.last_acc, self.last_acc_valid
-        )
+        reward_mode = str(self.cfg.task.get("reward_mode", "p2m")).lower()
+        reward_safety = torch.zeros((self.num_envs, 1), device=self.device)
+        reward_dobs = torch.zeros((self.num_envs, 1), device=self.device)
 
-        # -------------------------
-        # risk scalar + gating / relax (compute early for risk-conditioned shaping)
-        # -------------------------
-        risk_gate_goal = bool(self.cfg.task.get("risk_gate_goal", True))
-        risk_relax_enable = bool(self.cfg.task.get("risk_relax_enable", True))
-        risk_reward_enable = bool(self.cfg.task.get("risk_reward_enable", True))
+        if reward_mode == "p2m":
+            k_v = float(rw.get("k_v", rw.get("w_v", 1.2)))
+            k_a = float(rw.get("k_a", rw.get("w_a", 0.6)))
+            k_j = float(rw.get("k_j", rw.get("w_j", 0.2)))
+            k_h = float(rw.get("k_h", rw.get("w_h", 0.3)))
+            k_g = float(rw.get("k_g", rw.get("w_g", 0.8)))
+            k_s = float(rw.get("k_s", 1.0))
+            k_d = float(rw.get("k_d", 0.6))
 
-        if risk_gate_goal or risk_relax_enable or risk_reward_enable:
-            radial = getattr(self, "radial_channel", None)
-            lidar_for_risk = getattr(self, "lidar_scan_dis_risk", self.lidar_scan_dis)
-            risk_smax = self._compute_risk_smax(lidar_for_risk, radial, getattr(self, 'dismap_flow_zoom', None))
-        else:
+            beta_vel = float(self.cfg.task.get("p2m_beta_vel", 2.0))
+            beta_acc = float(self.cfg.task.get("p2m_beta_acc", 5.0))
+            beta_hei = float(self.cfg.task.get("p2m_beta_hei", 2.0))
+            hei_set_min = float(self.cfg.task.get("p2m_hei_set_min", self.fly_height - self.height_bound / 2))
+            hei_set_max = float(self.cfg.task.get("p2m_hei_set_max", self.fly_height + self.height_bound / 2))
+
+            reward_vel, reward_acc, reward_jerk, reward_height = self._compute_p2m_state_reward(
+                beta_vel, self.vel_min, self.vel_max, vel_magnitude,
+                beta_acc, self.acc_min, self.acc_max, acc_magnitude,
+                beta_hei, hei_set_min, hei_set_max, height,
+                acc, self.last_acc, touch_goal_mask,
+            )
+            reward_goal = self._compute_p2m_goal_reward(
+                self.drone.vel_w[..., :3],
+                self.rpos / distance_3d.clamp_min(1.0e-6),
+                self.last_dis2goal,
+                dis2goal_3d,
+                touch_goal_mask,
+            ).view(-1, 1)
+            reward_safety = self._compute_safety_reward(self.lidar_scan)
+            active = int(getattr(self, "_dobs_active_num", getattr(self, "dynamic_obs_num", 0)))
+            active = max(0, min(active, int(getattr(self, "dynamic_obs_num", 0))))
+            if active > 0 and (self.dobs_states is not None):
+                reward_dobs = self._compute_dobs_reward(
+                    self.dobs_states[:active],
+                    self.drone_state[..., :2].squeeze(1),
+                    self.drone.vel_w[..., :2].squeeze(1),
+                )
+
             risk_smax = torch.zeros(self.num_envs, device=self.device)
-        risk_smax_col = risk_smax.view(-1, 1)
-
-        # -------------------------
-        # speed reward (cruise speed shaping)
-        # R_v = exp(-((||v|| - v_ref)^2) / sigma_v^2)
-        # Optional: risk-conditioned speed target (slow down only in high-risk zones).
-        # -------------------------
-        try:
-            v_ref = float(self.cfg.task.get("v_ref", self.cfg.task.get("speed_ref", (self.vel_min + self.vel_max) * 0.5)))
-        except Exception:
-            v_ref = float((self.vel_min + self.vel_max) * 0.5)
-        try:
-            sigma_v = float(self.cfg.task.get("sigma_v", self.cfg.task.get("speed_sigma", max(0.5, 0.2 * float(self.vel_max)))))
-        except Exception:
-            sigma_v = max(0.5, 0.2 * float(self.vel_max))
-        sigma_v = float(max(sigma_v, 1.0e-3))
-
-        risk_speed_enable = bool(self.cfg.task.get("risk_speed_enable", False))
-        if risk_speed_enable:
-            k = float(self.cfg.task.get("risk_speed_k", 1.0))
-            min_scale = float(self.cfg.task.get("risk_speed_min_scale", 0.5))
-            sigma_scale = float(self.cfg.task.get("risk_speed_sigma_scale", 1.2))
-            scale = (1.0 - k * risk_smax_col).clamp(min=min_scale, max=1.0)
-            v_ref_eff = v_ref * scale
-            sigma_v_eff = sigma_v * (1.0 + (sigma_scale - 1.0) * risk_smax_col)
-        else:
-            v_ref_eff = v_ref
-            sigma_v_eff = sigma_v
-        vel_col = vel_magnitude.view(-1, 1)
-        reward_vel = torch.exp(-((vel_col - v_ref_eff) ** 2) / (sigma_v_eff ** 2 + 1.0e-6)).view(-1, 1)
-
-        # goal reward (ungated)
-        # Use planar velocity/direction when goal_use_planar is enabled, so vertical maneuvers
-        # (e.g., going over/under a low wall) are not directly penalized by the goal shaping.
-        vel_vec_goal = self.drone.vel_w[..., :2] if goal_use_planar else self.drone.vel_w[..., :3]
-        reward_goal = self._compute_goal_reward(
-            vel_vec_goal, vel_direction,
-            self.last_dis2goal, dis2goal
-        ).view(-1, 1)
-
-        # height reward with deadband + barrier + risk gate
-        reward_height = self._compute_height_reward(
-            height,
-            height_ref,
-            risk_smax_col,
-            virtual_ground,
-            virtual_ceiling,
-            w_h,
-        )
-
-        # goal gate g(risk)
-        if risk_gate_goal:
-            g_min = float(self.cfg.task.get("risk_gate_g_min", 0.3))
-            g_min = float(max(0.0, min(1.0, g_min)))
-            goal_gate = g_min + (1.0 - g_min) * (1.0 - risk_smax_col)
-            reward_goal = reward_goal * goal_gate
-        else:
+            risk_smax_col = risk_smax.view(-1, 1)
             goal_gate = torch.ones_like(reward_goal)
+            reward_risk = torch.zeros_like(reward_goal)
+            reward_risk_delta = torch.zeros_like(reward_goal)
 
-        # relax jerk & height constraints under high risk (reduce their weights, do not introduce drift)
-        if risk_relax_enable:
-            eta_j = float(self.cfg.task.get("risk_relax_eta_j", 0.5))
-            eta_j = float(max(0.0, min(1.0, eta_j)))
-            w_j_eff = (w_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
-            eta_a = float(self.cfg.task.get("risk_relax_eta_a", 0.0))
-            eta_a = float(max(0.0, min(1.0, eta_a)))
-            w_a_eff = (w_a * (1.0 - eta_a * risk_smax_col)).clamp_min(0.0)
+            reward_vel_weighted = k_v * reward_vel
+            reward_acc_weighted = k_a * reward_acc
+            reward_jerk_weighted = k_j * reward_jerk
+            reward_height_weighted = k_h * reward_height
+            reward_goal_weighted = k_g * reward_goal
+            reward_safety_weighted = k_s * reward_safety
+            reward_dobs_weighted = k_d * reward_dobs
+            reward_risk_weighted = reward_risk
+            reward_risk_delta_weighted = reward_risk_delta
+
+            reward = (
+                reward_vel_weighted
+                + reward_acc_weighted
+                + reward_jerk_weighted
+                + reward_height_weighted
+                + reward_goal_weighted
+                + reward_safety_weighted
+                + reward_dobs_weighted
+            ).view(-1, 1)
         else:
-            w_j_eff = torch.full_like(reward_jerk, w_j)
-            w_a_eff = torch.full_like(reward_acc, w_a)
+            reward_acc, reward_jerk = self._compute_state_reward(
+                acc, self.last_acc, self.last_acc_valid
+            )
 
-        # -------------------------
-        # risk avoidance reward (soft threshold + smooth growth)
-        # -------------------------
-        reward_risk = torch.zeros_like(reward_goal)
-        if risk_reward_enable:
-            rcfg = self.cfg.task.get("risk_cfg", {})
-            alpha = float(rcfg.get("alpha", 10.0))
-            rho0 = float(rcfg.get("rho0", 0.2))
-            # base weight
-            w_r = float(rcfg.get("w_r", 1.5))
+            risk_gate_goal = bool(self.cfg.task.get("risk_gate_goal", True))
+            risk_relax_enable = bool(self.cfg.task.get("risk_relax_enable", True))
+            risk_reward_enable = bool(self.cfg.task.get("risk_reward_enable", True))
 
-            reward_risk = -w_r * F.softplus(alpha * (risk_smax_col - rho0))
+            if risk_gate_goal or risk_relax_enable or risk_reward_enable:
+                radial = getattr(self, "radial_channel", None)
+                lidar_for_risk = getattr(self, "lidar_scan_dis_risk", self.lidar_scan_dis)
+                risk_smax = self._compute_risk_smax(lidar_for_risk, radial, getattr(self, 'dismap_flow_zoom', None))
+            else:
+                risk_smax = torch.zeros(self.num_envs, device=self.device)
+            risk_smax_col = risk_smax.view(-1, 1)
 
-        # -------------------------
-        # risk-delta shaping (encourage timely avoidance)
-        # -------------------------
-        reward_risk_delta = torch.zeros_like(reward_goal)
-        if bool(self.cfg.task.get("risk_delta_enable", False)):
-            w_rd = float(self.cfg.task.get("risk_delta_w", 1.0))
-            delta_clip = float(self.cfg.task.get("risk_delta_clip", 0.5))
-            rcfg = self.cfg.task.get("risk_cfg", {})
-            rho_focus = float(self.cfg.task.get("risk_delta_rho", rcfg.get("rho0", 0.2)))
+            try:
+                v_ref = float(self.cfg.task.get("v_ref", self.cfg.task.get("speed_ref", (self.vel_min + self.vel_max) * 0.5)))
+            except Exception:
+                v_ref = float((self.vel_min + self.vel_max) * 0.5)
+            try:
+                sigma_v = float(self.cfg.task.get("sigma_v", self.cfg.task.get("speed_sigma", max(0.5, 0.2 * float(self.vel_max)))))
+            except Exception:
+                sigma_v = max(0.5, 0.2 * float(self.vel_max))
+            sigma_v = float(max(sigma_v, 1.0e-3))
 
-            if self.last_risk_smax is None:
-                self.last_risk_smax = risk_smax.clone()
-            if self.last_risk_valid is None:
-                self.last_risk_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            risk_speed_enable = bool(self.cfg.task.get("risk_speed_enable", False))
+            if risk_speed_enable:
+                k = float(self.cfg.task.get("risk_speed_k", 1.0))
+                min_scale = float(self.cfg.task.get("risk_speed_min_scale", 0.5))
+                sigma_scale = float(self.cfg.task.get("risk_speed_sigma_scale", 1.2))
+                scale = (1.0 - k * risk_smax_col).clamp(min=min_scale, max=1.0)
+                v_ref_eff = v_ref * scale
+                sigma_v_eff = sigma_v * (1.0 + (sigma_scale - 1.0) * risk_smax_col)
+            else:
+                v_ref_eff = v_ref
+                sigma_v_eff = sigma_v
+            vel_col = vel_magnitude.view(-1, 1)
+            reward_vel = torch.exp(-((vel_col - v_ref_eff) ** 2) / (sigma_v_eff ** 2 + 1.0e-6)).view(-1, 1)
 
-            prev = self.last_risk_smax.view(-1, 1)
-            valid = self.last_risk_valid.view(-1, 1)
-            prev = torch.where(valid, prev, risk_smax_col)
-            # Only reward *reductions* in risk to encourage timely avoidance
-            # (do not penalize increases here; risk penalty already covers that).
-            delta = (prev - risk_smax_col).clamp(min=0.0, max=delta_clip)
+            vel_vec_goal = self.drone.vel_w[..., :2] if goal_use_planar else self.drone.vel_w[..., :3]
+            reward_goal = self._compute_goal_reward(
+                vel_vec_goal, vel_direction,
+                self.last_dis2goal, dis2goal
+            ).view(-1, 1)
 
-            focus_prev = (prev - rho_focus).clamp(min=0.0)
-            focus_now = (risk_smax_col - rho_focus).clamp(min=0.0)
-            focus = torch.maximum(focus_prev, focus_now)
+            reward_height = self._compute_height_reward(
+                height,
+                height_ref,
+                risk_smax_col,
+                virtual_ground,
+                virtual_ceiling,
+                w_h,
+            )
 
-            reward_risk_delta = w_rd * delta * focus
+            if risk_gate_goal:
+                g_min = float(self.cfg.task.get("risk_gate_g_min", 0.3))
+                g_min = float(max(0.0, min(1.0, g_min)))
+                goal_gate = g_min + (1.0 - g_min) * (1.0 - risk_smax_col)
+                reward_goal = reward_goal * goal_gate
+            else:
+                goal_gate = torch.ones_like(reward_goal)
 
-        # -------------------------
-        # total reward (before collision penalty)
-        # -------------------------
-        reward = (
-            w_v * reward_vel
-            + w_a_eff * reward_acc
-            + w_j_eff * reward_jerk
-            + reward_height
-            + w_g * reward_goal
-            + reward_risk
-            + reward_risk_delta
-        ).view(-1, 1)
+            if risk_relax_enable:
+                eta_j = float(self.cfg.task.get("risk_relax_eta_j", 0.5))
+                eta_j = float(max(0.0, min(1.0, eta_j)))
+                w_j_eff = (w_j * (1.0 - eta_j * risk_smax_col)).clamp_min(0.0)
+                eta_a = float(self.cfg.task.get("risk_relax_eta_a", 0.0))
+                eta_a = float(max(0.0, min(1.0, eta_a)))
+                w_a_eff = (w_a * (1.0 - eta_a * risk_smax_col)).clamp_min(0.0)
+            else:
+                w_j_eff = torch.full_like(reward_jerk, w_j)
+                w_a_eff = torch.full_like(reward_acc, w_a)
+
+            reward_risk = torch.zeros_like(reward_goal)
+            if risk_reward_enable:
+                rcfg = self.cfg.task.get("risk_cfg", {})
+                alpha = float(rcfg.get("alpha", 10.0))
+                rho0 = float(rcfg.get("rho0", 0.2))
+                w_r = float(rcfg.get("w_r", 1.5))
+                reward_risk = -w_r * F.softplus(alpha * (risk_smax_col - rho0))
+
+            reward_risk_delta = torch.zeros_like(reward_goal)
+            if bool(self.cfg.task.get("risk_delta_enable", False)):
+                w_rd = float(self.cfg.task.get("risk_delta_w", 1.0))
+                delta_clip = float(self.cfg.task.get("risk_delta_clip", 0.5))
+                rcfg = self.cfg.task.get("risk_cfg", {})
+                rho_focus = float(self.cfg.task.get("risk_delta_rho", rcfg.get("rho0", 0.2)))
+
+                if self.last_risk_smax is None:
+                    self.last_risk_smax = risk_smax.clone()
+                if self.last_risk_valid is None:
+                    self.last_risk_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+                prev = self.last_risk_smax.view(-1, 1)
+                valid = self.last_risk_valid.view(-1, 1)
+                prev = torch.where(valid, prev, risk_smax_col)
+                delta = (prev - risk_smax_col).clamp(min=0.0, max=delta_clip)
+
+                focus_prev = (prev - rho_focus).clamp(min=0.0)
+                focus_now = (risk_smax_col - rho_focus).clamp(min=0.0)
+                focus = torch.maximum(focus_prev, focus_now)
+
+                reward_risk_delta = w_rd * delta * focus
+
+            reward_vel_weighted = w_v * reward_vel
+            reward_acc_weighted = w_a_eff * reward_acc
+            reward_jerk_weighted = w_j_eff * reward_jerk
+            reward_height_weighted = reward_height
+            reward_goal_weighted = w_g * reward_goal
+            reward_safety_weighted = reward_safety
+            reward_dobs_weighted = reward_dobs
+            reward_risk_weighted = reward_risk
+            reward_risk_delta_weighted = reward_risk_delta
+
+            reward = (
+                reward_vel_weighted
+                + reward_acc_weighted
+                + reward_jerk_weighted
+                + reward_height_weighted
+                + reward_goal_weighted
+                + reward_risk_weighted
+                + reward_risk_delta_weighted
+            ).view(-1, 1)
 
         # success bonus (optional)
         success_bonus = float(self.cfg.task.get("success_bonus", 0.0))
@@ -2151,6 +2409,9 @@ class Env(IsaacEnv):
         vel_limit_term = vel_limit_mask if terminate_on_vel_limit else zero
 
         # penalties when not terminating (optional)
+        pen = float(self.cfg.task.get("height_low_penalty", 20.0))
+        if pen != 0.0:
+            reward = reward - pen * height_low.float()
         if not terminate_on_height_high:
             pen = float(self.cfg.task.get("height_high_penalty", 0.0))
             if pen != 0.0:
@@ -2275,13 +2536,15 @@ class Env(IsaacEnv):
         # -------------------------
         if self.cfg.task.get("debug_print_reward", False) and (int(self.progress_buf[0].item()) % 50) == 0:
             print(
-                f"\r vel: {(w_v * reward_vel[0]).item():.3f}, "
-                f"acc: {(w_a * reward_acc[0]).item():.3f}, "
-                f"jerk: {(w_j_eff[0] * reward_jerk[0]).item():.3f}, "
-                f"height: {(w_h_eff[0] * reward_height[0]).item():.3f}, "
-                f"goal: {(w_g * reward_goal[0]).item():.3f}, "
+                f"\r vel: {reward_vel_weighted[0].item():.3f}, "
+                f"acc: {reward_acc_weighted[0].item():.3f}, "
+                f"jerk: {reward_jerk_weighted[0].item():.3f}, "
+                f"height: {reward_height_weighted[0].item():.3f}, "
+                f"goal: {reward_goal_weighted[0].item():.3f}, "
                 f"gate: {goal_gate[0].item():.3f}, "
-                f"risk: {reward_risk[0].item():.3f}, "
+                f"safety: {reward_safety_weighted[0].item():.3f}, "
+                f"dobs: {reward_dobs_weighted[0].item():.3f}, "
+                f"risk: {reward_risk_weighted[0].item():.3f}, "
                 f"coll: {reward_collision[0].item():.3f}, "
                 f"total: {reward[0].item():.3f}\r",
                 end="",
@@ -2296,10 +2559,19 @@ class Env(IsaacEnv):
         self.stats["reward_jerk"].add_(reward_jerk)
         self.stats["reward_height"].add_(reward_height)
         self.stats["reward_goal"].add_(reward_goal)
+        self.stats["reward_safety"].add_(reward_safety)
+        self.stats["reward_dobs"].add_(reward_dobs)
         self.stats["reward_risk"].add_(reward_risk)
         self.stats["reward_risk_delta"].add_(reward_risk_delta)
         self.stats["reward_collision"].add_(reward_collision)
         self.stats["reward_bound"].add_(reward_bound)
+        self.stats["reward_velocity_weighted"].add_(reward_vel_weighted)
+        self.stats["reward_acceleration_weighted"].add_(reward_acc_weighted)
+        self.stats["reward_jerk_weighted"].add_(reward_jerk_weighted)
+        self.stats["reward_height_weighted"].add_(reward_height_weighted)
+        self.stats["reward_goal_weighted"].add_(reward_goal_weighted)
+        self.stats["reward_risk_weighted"].add_(reward_risk_weighted)
+        self.stats["reward_risk_delta_weighted"].add_(reward_risk_delta_weighted)
 
         # scalar diagnostics (store current-step values, not accumulated sums)
         self.stats["risk_smax"].copy_(risk_smax_col)
@@ -2311,6 +2583,20 @@ class Env(IsaacEnv):
             self.stats["radial_abs_mean"].copy_(self.radial_abs_mean)
         if self.flow_abs_mean is not None:
             self.stats["flow_abs_mean"].copy_(self.flow_abs_mean)
+        for name in (
+            "obs_ch0_mean",
+            "obs_ch0_max",
+            "obs_ch1_abs_mean",
+            "obs_ch1_pos_ratio",
+            "obs_ch1_neg_ratio",
+            "obs_ch2_mean",
+            "obs_ch2_max",
+            "obs_ch3_mean",
+            "obs_ch3_max",
+        ):
+            value = getattr(self, name, None)
+            if value is not None:
+                self.stats[name].copy_(value)
 
         vel_magnitude_col = vel_magnitude.view(self.num_envs, 1)
         step_count = self.progress_buf.clamp_min(1.0).unsqueeze(1)
@@ -2380,6 +2666,156 @@ class Env(IsaacEnv):
             },
             self.batch_size,
         )
+
+    def _compute_p2m_state_reward(
+        self,
+        beta_vel,
+        vel_set_min,
+        vel_set_max,
+        vel_magnitude,
+        beta_acc,
+        acc_set_min,
+        acc_set_max,
+        acc_magnitude,
+        beta_hei,
+        hei_set_min,
+        hei_set_max,
+        height,
+        acc,
+        last_acc,
+        touch_goal_mask,
+    ):
+        if vel_magnitude.ndim == 2 and vel_magnitude.shape[-1] == 1:
+            vel_magnitude = vel_magnitude.squeeze(-1)
+        if acc_magnitude.ndim == 1:
+            acc_magnitude = acc_magnitude.view(-1, 1)
+        if height.ndim == 2 and height.shape[-1] == 1:
+            height = height.squeeze(-1)
+        touch_mask = touch_goal_mask.squeeze(-1) if touch_goal_mask.ndim == 2 else touch_goal_mask
+
+        reward_vel = torch.log(
+            torch.exp(
+                -beta_vel
+                * (
+                    torch.clamp(vel_set_min - vel_magnitude, min=0.0)
+                    + torch.clamp(vel_magnitude - vel_set_max, min=0.0)
+                )
+            )
+            + 1.0
+        )
+        reward_vel[touch_mask] = torch.log(
+            torch.exp(-beta_vel * torch.clamp(vel_magnitude[touch_mask] - vel_set_max, min=0.0)) + 1.0
+        )
+        reward_acc = torch.log(
+            torch.exp(
+                -beta_acc
+                * (
+                    torch.clamp(acc_set_min - acc_magnitude, min=0.0)
+                    + torch.clamp(acc_magnitude - acc_set_max, min=0.0)
+                )
+            )
+            + 1.0
+        )
+        reward_jerk = 1.0 / (1.0 + torch.norm(acc - last_acc, dim=-1, keepdim=True))
+        reward_height = torch.log(
+            torch.exp(
+                -beta_hei
+                * (
+                    torch.clamp(hei_set_min - height, min=0.0)
+                    + torch.clamp(height - hei_set_max, min=0.0)
+                )
+            )
+            + 1.0
+        )
+        return reward_vel.view(-1, 1), reward_acc.view(-1, 1), reward_jerk.view(-1, 1), reward_height.view(-1, 1)
+
+    def _compute_p2m_goal_reward(self, vel_vector, vel_direction, last_dis2goal, dis2goal, touch_goal_mask):
+        if vel_vector.ndim == 3 and vel_vector.shape[1] == 1:
+            vel_vec = vel_vector.squeeze(1)
+        else:
+            vel_vec = vel_vector
+        if vel_direction.ndim == 3 and vel_direction.shape[1] == 1:
+            vel_dir = vel_direction.squeeze(1)
+        else:
+            vel_dir = vel_direction
+        last_d = last_dis2goal.squeeze(-1) if last_dis2goal.ndim == 2 else last_dis2goal
+        d_now = dis2goal.squeeze(-1) if dis2goal.ndim == 2 else dis2goal
+        touch_mask = touch_goal_mask.squeeze(-1) if touch_goal_mask.ndim == 2 else touch_goal_mask
+
+        reward_goal_dir = (vel_vec * vel_dir).sum(-1).clip(max=2.0)
+        reward_goal_dis = (torch.exp(last_d - d_now) - 1.0) * 10.0
+        reward_goal_dis[touch_mask] = 0.0
+        return reward_goal_dir + reward_goal_dis
+
+    def _compute_safety_reward(self, lidar_scan):
+        if lidar_scan.ndim == 3:
+            lidar_scan = lidar_scan.unsqueeze(1)
+        elif lidar_scan.ndim == 4 and lidar_scan.size(1) != 1:
+            lidar_scan = lidar_scan[:, :1]
+        lidar_values = self.lidar_range - lidar_scan
+        lidar_values_merged = lidar_values.reshape(
+            lidar_values.size(0), lidar_values.size(1), -1
+        ).squeeze(1)
+        lidar_values_clip = torch.clamp(lidar_values_merged - self.safety_dis, min=0.0)
+        obs_mask = lidar_values_merged <= (self.lidar_range / 10.0)
+        obs_count = obs_mask.sum(dim=1)
+        obs_dist = torch.where(
+            obs_count != 0,
+            (lidar_values_clip * obs_mask).sum(dim=1) / obs_count.clamp_min(1),
+            lidar_values_clip.min(dim=1)[0],
+        )
+        reward_safety = torch.log(obs_dist).clamp_min(-5.0)
+        return reward_safety.reshape(self.num_envs, 1)
+
+    def _compute_dobs_reward(self, obstacle_tensor, drone_pos, drone_vel):
+        num_env = drone_pos.shape[0]
+        if obstacle_tensor is None or obstacle_tensor.numel() == 0:
+            return torch.zeros((num_env, 1), device=self.device)
+        n = obstacle_tensor.shape[0]
+        pos = obstacle_tensor[:, 0]
+        vel = obstacle_tensor[:, 1]
+        rad = obstacle_tensor[:, 2, 0]
+
+        drone_pos_expanded = drone_pos.unsqueeze(1).expand(num_env, n, 2)
+        drone_vel_expanded = drone_vel.unsqueeze(1).expand(num_env, n, 2)
+        pos_expanded = pos.unsqueeze(0).expand(num_env, n, 2)
+        obstacle_vel_drone_frame = vel - drone_vel_expanded
+        if self.reward_dobs_max is None or self.reward_dobs_max.shape[0] != num_env:
+            self.reward_dobs_max = torch.full((num_env, 1), float("-inf"), device=self.device)
+
+        r = pos_expanded - drone_pos_expanded
+        dot_product = (r * obstacle_vel_drone_frame).sum(dim=2)
+        r_norm = r.norm(dim=2).clamp_min(1.0e-6)
+        v_norm = obstacle_vel_drone_frame.norm(dim=2).clamp_min(1.0e-6)
+        cos_theta = (dot_product / (r_norm * v_norm)).clamp(-1.0, 1.0)
+        theta = torch.acos(cos_theta)
+        coll_mask = theta < (torch.pi / 2)
+
+        vel_magnitude = torch.norm(vel, dim=1)
+        dist = torch.norm(pos_expanded - drone_pos_expanded, dim=2) - rad
+        unit_velocity = vel / (vel_magnitude.unsqueeze(1) + 1.0e-6)
+        unit_velocity_expanded = unit_velocity.unsqueeze(0).expand(num_env, n, 2)
+        v_x = unit_velocity_expanded[..., 0]
+        v_y = unit_velocity_expanded[..., 1]
+        x = pos_expanded[..., 0]
+        y = pos_expanded[..., 1]
+        x_d = drone_pos_expanded[..., 0]
+        y_d = drone_pos_expanded[..., 1]
+        speed_line_distance = torch.abs((x_d - x) * v_y - (y_d - y) * v_x)
+        fov_mask = dist <= (self.lidar_range * 0.75)
+        obs_count = fov_mask.sum(dim=1).clamp(min=1)
+
+        k_v = torch.norm(obstacle_vel_drone_frame, dim=2)
+        k_theta = 1.0 - (2.0 * theta / torch.pi)
+        k_d = torch.exp(1.0 / (1.0 + speed_line_distance))
+        k_total = torch.where(coll_mask != 0, 1.0 + k_v * k_theta * k_d, torch.ones_like(theta))
+
+        r_d_zoom = (dist - self.safety_dis).clamp_min(0.0) / (k_total + 1.0e-6)
+        r_d = torch.log(r_d_zoom).clamp_min(-5.0)
+        reward_dobs = ((r_d * fov_mask).sum(dim=1) / obs_count).reshape(num_env, 1)
+        self.reward_dobs_max = torch.max(self.reward_dobs_max, reward_dobs)
+        reward_dobs = torch.where(reward_dobs == 0, self.reward_dobs_max, reward_dobs)
+        return reward_dobs
 
     def _compute_state_reward(self, acc, last_acc, last_acc_valid=None):
         acc_sq = (acc ** 2).sum(dim=-1, keepdim=True)

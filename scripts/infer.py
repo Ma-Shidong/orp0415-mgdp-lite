@@ -18,7 +18,9 @@ from torchrl.data.tensor_specs import (
 
 import torch.nn as nn
 from einops.layers.torch import Rearrange
+from resources.learning.modules.rnn import GRU
 from resources.learning.ppo.ppo import PPOConfig, make_mlp, Actor, IndependentNormal
+from resources.utils.safety_shield import apply_target_acc_safety_shield
 from tensordict import TensorDict
 from tensordict.nn import TensorDictSequential, TensorDictModule, TensorDictModuleBase
 from torchrl.envs.transforms import CatTensors
@@ -30,7 +32,12 @@ from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Odometry
 
 from resources.NeuFlow_v2.infer_lidar import init_neuflow
-from resources.utils.torch import quat_rotate, quat_rotate_inverse
+from resources.utils.torch import (
+    euler_to_quaternion,
+    quat_rotate,
+    quat_rotate_inverse,
+    quaternion_to_euler,
+)
 
 
 
@@ -80,45 +87,106 @@ def _resolve_device():
 
 
 class PPOPolicy(TensorDictModuleBase):
-    def __init__(self, cfg: PPOConfig, observation_spec: CompositeSpec, action_spec: CompositeSpec, reward_spec: TensorSpec, device):
+    def __init__(
+        self,
+        cfg: PPOConfig,
+        model_cfg,
+        observation_spec: CompositeSpec,
+        action_spec: CompositeSpec,
+        reward_spec: TensorSpec,
+        device,
+    ):
         super().__init__()
         self.cfg = cfg
+        self.model_cfg = model_cfg
         self.device = device
         self.action_dim = 3
+        temporal_cfg = getattr(model_cfg, "temporal", None) if model_cfg is not None else None
+        self.temporal_enable = bool(getattr(temporal_cfg, "enable", False))
+        self.temporal_type = str(getattr(temporal_cfg, "type", "gru")).lower()
+        self.temporal_hidden_size = int(getattr(temporal_cfg, "hidden_size", 128))
+        if self.temporal_enable and self.temporal_type != "gru":
+            raise NotImplementedError(f"Unsupported temporal core: {self.temporal_type}")
+        if self.temporal_enable and self.temporal_hidden_size != 128:
+            raise ValueError("Infer temporal core currently requires hidden_size=128.")
+        self._rollout_hidden = None
 
-        fake_input = observation_spec.zero()
-
-        cnn = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+        self.cnn = nn.Sequential(
+            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]),
+            nn.ELU(),
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]),
+            nn.ELU(),
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]),
+            nn.ELU(),
             Rearrange("n c w h -> n (c w h)"),
-            nn.LazyLinear(128), nn.LayerNorm(128)
+            nn.LazyLinear(128),
+            nn.LayerNorm(128),
         )
-        mlp = make_mlp([256, 256])
+        self.feature_mlp = make_mlp([256, 256])
 
         self.encoder = TensorDictSequential(
-            TensorDictModule(BatchConv2dWrapper(cnn), [("agents", "observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(BatchConv2dWrapper(self.cnn), [("agents", "observation", "lidar")], ["_cnn_feature"]),
             CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
-            TensorDictModule(mlp, ["_feature"], ["_feature"]),
+            TensorDictModule(self.feature_mlp, ["_feature"], ["_feature"]),
         ).to(self.device)
+        self.temporal_core = GRU(128, self.temporal_hidden_size).to(self.device) if self.temporal_enable else None
 
         self.actor = ProbabilisticActor(
             TensorDictModule(Actor(self.action_dim), ["_feature"], ["loc", "scale"]),
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=False
+            return_log_prob=False,
         ).to(self.device)
 
-        self.encoder(fake_input)
+        fake_input = observation_spec.zero()
+        self._encode_features(fake_input)
         self.actor(fake_input)
+        self.reset_rollout_state()
 
-    def __call__(self, tensordict: TensorDict):
-        self.encoder(tensordict)
-        self.actor(tensordict)
-        tensordict.exclude("loc", "scale", "_feature", inplace=True)
+    def reset_rollout_state(self):
+        self._rollout_hidden = None
+
+    def _run_cnn(self, lidar: torch.Tensor) -> torch.Tensor:
+        leading = lidar.shape[:-3]
+        x = lidar.reshape(-1, *lidar.shape[-3:])
+        y = self.cnn(x)
+        return y.reshape(*leading, -1)
+
+    def _apply_last_dim(self, module: nn.Module, tensor: torch.Tensor) -> torch.Tensor:
+        leading = tensor.shape[:-1]
+        y = module(tensor.reshape(-1, tensor.shape[-1]))
+        return y.reshape(*leading, -1)
+
+    def _encode_features(self, tensordict: TensorDict):
+        lidar = tensordict[("agents", "observation", "lidar")]
+        state = tensordict[("agents", "observation", "state")]
+        cnn_feature = self._run_cnn(lidar)
+        if self.temporal_enable and self.temporal_core is not None:
+            batch = int(cnn_feature.shape[0])
+            if self._rollout_hidden is None or self._rollout_hidden.shape[0] != batch:
+                self._rollout_hidden = torch.zeros(batch, self.temporal_hidden_size, device=cnn_feature.device, dtype=cnn_feature.dtype)
+            cnn_feature_mem, next_hidden = self.temporal_core(cnn_feature, h=self._rollout_hidden)
+            self._rollout_hidden = next_hidden.detach()
+        else:
+            cnn_feature_mem = cnn_feature
+        feature = self._apply_last_dim(self.feature_mlp, torch.cat([cnn_feature_mem, state], dim=-1))
+        tensordict.set("_cnn_feature", cnn_feature)
+        tensordict.set("_cnn_feature_mem", cnn_feature_mem)
+        tensordict.set("_feature", feature)
         return tensordict
+
+    def forward(self, tensordict: TensorDict):
+        self._encode_features(tensordict)
+        self.actor(tensordict)
+        tensordict.exclude("loc", "scale", "_feature", "_cnn_feature", "_cnn_feature_mem", inplace=True)
+        return tensordict
+
+    @torch.no_grad()
+    def act_mean(self, tensordict: TensorDict) -> torch.Tensor:
+        self._encode_features(tensordict)
+        dist = self.actor.get_dist(tensordict)
+        return dist.mean
 
 
 class Infer:
@@ -174,7 +242,18 @@ class Infer:
         # collision handling (virtual stop when too close to obstacles)
         self.collision_stop = bool(self.cfg.task.get("collision_stop", True))
         self.safety_dis = float(self.cfg.task.get("safety_dis", 0.3))
+        self.safety_shield_enable = bool(self.cfg.task.get("safety_shield_enable", True))
+        self.safety_shield_soft_margin = float(self.cfg.task.get("safety_shield_soft_margin", 0.8))
+        self.safety_shield_floor_margin = float(self.cfg.task.get("safety_shield_floor_margin", 0.35))
+        self.safety_shield_floor_gain = float(self.cfg.task.get("safety_shield_floor_gain", 4.0))
+        self.safety_shield_floor_bias_max = float(self.cfg.task.get("safety_shield_floor_bias_max", 2.0))
         self.min_depth = None
+        self.last_shield_info = {
+            "shield_active": False,
+            "shield_reason": "none",
+            "shield_scale_xy": 1.0,
+            "shield_floor_bias": 0.0,
+        }
 
         # optionally freeze motion when reaching the goal
         self.stop_when_reach_goal = bool(self.cfg.task.get("stop_when_reach_goal", False))
@@ -190,7 +269,7 @@ class Infer:
         self.flow_slide_window = 5
         # reference limits (match training defaults; can be overridden in cfg.task)
         self.vel_ref = float(self.cfg.task.get("vel_max", 5.0))
-        self.acc_ref = float(self.cfg.task.get("acc_max", 10.0))
+        self.acc_ref = float(self.cfg.task.get("acc_ref", self.cfg.task.get("acc_max", 10.0)))
 
         # Kinematic sim yaw (used only for publishing /sim/odom orientation).
         # Training controller locks yaw to pi/4 by default; keep the same default here.
@@ -418,6 +497,7 @@ class Infer:
         
         self.policy = PPOPolicy(
             self.cfg.algo,
+            getattr(self.cfg, "model", None),
             self.observation_spec,
             action_spec,
             reward_spec,
@@ -445,8 +525,8 @@ class Infer:
         
         self.tensordict = self.observation_spec.zero()
         with torch.no_grad():
-            self.policy.encoder(self.tensordict)
-            self.policy.actor(self.tensordict)
+            _ = self.policy.act_mean(self.observation_spec.zero())
+        self.policy.reset_rollout_state()
 
     def init_neuflow(self):
         self.dismap_flow_size = (96, 16)
@@ -462,6 +542,8 @@ class Infer:
             return
         z = self.zpose
         self.target_pos_np = [float(msg.pose.position.x), float(msg.pose.position.y), float(z)]
+        if hasattr(self, "policy"):
+            self.policy.reset_rollout_state()
 
     def odom_callback(self, msg):
         self.odom = msg
@@ -521,12 +603,10 @@ class Infer:
         tensordict = self.prepare_input(msg)
 
         with torch.no_grad():
-            self.policy.encoder(tensordict)
-            dist = self.policy.actor.get_dist(tensordict)
-            raw_action = dist.mean
+            raw_action = self.policy.act_mean(tensordict)
 
         raw_action = torch.nan_to_num(raw_action, nan=0.0, posinf=0.0, neginf=0.0)
-        # policy outputs normalized actions (roughly [-1, 1]), env scales by acc_max
+        # policy outputs normalized actions (roughly [-1, 1]), env scales by acc_ref
         raw_action = torch.clamp(raw_action, -1.0, 1.0)
         target_acc = raw_action * self.acc_ref
         # Optional goal-directed acceleration bias (helps if the policy prefers "just avoiding" and not making progress).
@@ -541,6 +621,40 @@ class Infer:
             target_acc = torch.clamp(target_acc, -self.acc_ref, self.acc_ref)
 
         target_acc = torch.clamp(target_acc, -self.acc_ref, self.acc_ref)
+        if self.safety_shield_enable:
+            shield = apply_target_acc_safety_shield(
+                target_acc,
+                min_depth=float("inf") if self.min_depth is None else float(self.min_depth),
+                z=float(self.posz),
+                virtual_ground=float(self.virtual_ground),
+                safety_dis=float(self.safety_dis),
+                acc_ref=float(self.acc_ref),
+                soft_margin=float(self.safety_shield_soft_margin),
+                floor_margin=float(self.safety_shield_floor_margin),
+                floor_gain=float(self.safety_shield_floor_gain),
+                floor_bias_max=float(self.safety_shield_floor_bias_max),
+            )
+            target_acc = shield["target_acc"]
+            self.last_shield_info = {
+                "shield_active": bool(shield["shield_active"][0].item()),
+                "shield_reason": shield["shield_reason"][0],
+                "shield_scale_xy": float(shield["shield_scale_xy"][0].item()),
+                "shield_floor_bias": float(shield["shield_floor_bias"][0].item()),
+                "target_acc_before": shield["target_acc_before"][0].detach().cpu().tolist(),
+                "target_acc_after": shield["target_acc_after"][0].detach().cpu().tolist(),
+            }
+            if self.last_shield_info["shield_active"]:
+                rospy.loginfo_throttle(
+                    1.0,
+                    "[infer] shield_active=1 shield_reason=%s shield_scale_xy=%.3f shield_floor_bias=%.3f target_acc_before=%s target_acc_after=%s"
+                    % (
+                        self.last_shield_info["shield_reason"],
+                        self.last_shield_info["shield_scale_xy"],
+                        self.last_shield_info["shield_floor_bias"],
+                        self.last_shield_info["target_acc_before"],
+                        self.last_shield_info["target_acc_after"],
+                    ),
+                )
         self.last_target_acc = target_acc
         self.acccmd_2_odom(target_acc)
 
@@ -662,9 +776,13 @@ class Infer:
             self.depth_image_queue = deque([lidar_scan_dis] * window, maxlen=window)
         else:
             self.depth_image_queue.append(lidar_scan_dis)
-        depth_smoothed = torch.mean(torch.stack(list(self.depth_image_queue)), dim=0)
+        depth_stack = torch.stack(list(self.depth_image_queue))
+        depth_smoothed = torch.mean(depth_stack, dim=0)
+        depth_denoised = torch.median(depth_stack, dim=0).values
 
         radial_channel = torch.full_like(lidar_scan_dis, self.lidar_radial_invalid_value)
+        radial_speed_channel = torch.zeros_like(lidar_scan_dis)
+        radial_valid_channel = torch.zeros_like(lidar_scan_dis, dtype=torch.bool)
         if (self.prev_depth_smoothed is not None) and (self.prev_pos is not None) and (self.prev_rot is not None):
             dir_flat = self.lidar_dirs.reshape(1, -1, 3)
             prev_depth_flat = self.prev_depth_smoothed.reshape(1, -1)
@@ -686,7 +804,9 @@ class Infer:
             p_prev_curr = quat_rotate_inverse(curr_rot_expand, p_prev_world - curr_pos_expand)
 
             pred_depth = (p_prev_curr * dir_flat).sum(-1)
-            dt = float(self.lidar_radial_dt)  # match env fixed dt
+            dt = float(self.lidar_radial_dt)
+            if bool(self.cfg.task.get("mgdp_v2_use_effective_dt", False)):
+                dt = float(self.cfg.task.get("sim_dt", self.lidar_radial_dt))
             residual = curr_depth_flat - pred_depth
             # 保留靠近为正的语义，突出障碍物接近的危险性
             radial_speed = - residual / max(dt, 1e-6) 
@@ -708,6 +828,10 @@ class Infer:
                 torch.full_like(radial_norm, self.lidar_radial_invalid_value),
             )
             radial_channel = radial_flat.reshape(1, 1, *self.lidar_resolution)
+            radial_speed_channel = torch.where(valid, radial_speed, torch.zeros_like(radial_speed)).reshape(
+                1, 1, *self.lidar_resolution
+            )
+            radial_valid_channel = valid.reshape(1, 1, *self.lidar_resolution)
 
         rpos = self.target_pos - drone_state[..., :3]
         target_dir = rpos / rpos.norm(dim=-1, keepdim=True).clamp(1e-6)
@@ -720,57 +844,6 @@ class Infer:
             acc_fb = torch.zeros_like(vel_fb)
         acc_input = acc_fb/self.acc_ref
 
-        lidar_dis_for_flow = torch.where(
-            torch.isfinite(lidar_dis),
-            lidar_dis,
-            torch.full_like(lidar_dis, self.lidar_range),
-        )
-        scan4flow = (self.lidar_range - lidar_dis_for_flow.unsqueeze(1)).reshape(
-                            1, 1,
-                            self.lidar_h_res * self.lidar_h_sample,
-                            self.lidar_v_res * self.lidar_v_sample
-                            )/self.lidar_range
-
-        scan4flow_scaled = torch.nn.functional.interpolate(scan4flow.half() * 255.,
-                                                            self.dismap_flow_size,
-                                                            mode='bilinear',
-                                                            align_corners=False)
-
-        if self.dismap_image_queue is None:
-            self.dismap_image_queue = deque([scan4flow_scaled] * int(self.flow_gap + 3), maxlen=int(self.flow_gap + 3))
-        else:
-            self.dismap_image_queue.append(scan4flow_scaled)
-
-        dismap_tensor = list(self.dismap_image_queue)
-        dismap_image0 = torch.cat(dismap_tensor[:3], dim=1)
-        dismap_image1 = torch.cat(dismap_tensor[-3:], dim=1)
-
-        with torch.no_grad():
-            dismap_image0 = dismap_image0.half()
-            dismap_image1 = dismap_image1.half()
-            dismap_flow = self.flow_est_model(dismap_image0, dismap_image1)[-1]
-
-        if self.dismap_flow_queue is None:
-            self.flow_slide_window = int(self.flow_slide_window)
-            self.dismap_flow_queue = deque([dismap_flow] * self.flow_slide_window, maxlen=self.flow_slide_window)
-        else:
-            self.dismap_flow_queue.append(dismap_flow)
-        dismap_flow_mean = torch.mean(torch.stack(list(self.dismap_flow_queue)), dim=0)
-        dismap_flow_scaled = torch.nn.functional.interpolate(dismap_flow_mean.float(),
-                                                                    self.lidar_resolution,
-                                                                    mode='bilinear',
-                                                                    align_corners=False)
-
-        flow_zoom = torch.nan_to_num(dismap_flow_scaled.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        flow_normalized = torch.cat(
-            [
-                (flow_zoom[:, 0:1, :, :] / 3.6),
-                (flow_zoom[:, 1:2, :, :] / 0.6),
-            ],
-            dim=1,
-        )
-        flow_normalized = torch.clamp(flow_normalized, -1.0, 1.0)
-
         # training uses proximity channel = (range - distance) / range
         scan_prox = self.lidar_range - lidar_scan_dis
         scan_normalized = torch.clamp(torch.nan_to_num(scan_prox / max(self.lidar_range, 1e-6), nan=0.0), 0.0, 1.0)
@@ -781,8 +854,134 @@ class Infer:
             -1.0,
             1.0,
         )
+        input_mode = str(self.cfg.task.get("input_mode", "p2m")).lower()
+        p2m_radial_channel = radial_channel
+        if input_mode == "p2m":
+            p2m_radial_channel = torch.zeros_like(radial_channel)
 
-        dismap_stack = torch.cat([scan_normalized, flow_normalized, radial_channel], dim=1)
+        flow_normalized = torch.zeros((1, 2, *self.lidar_resolution), device=self.device, dtype=lidar_scan_dis.dtype)
+        if input_mode not in ("mgdp", "mgdp_lite", "mgdp_lite_v2"):
+            lidar_dis_for_flow = torch.where(
+                torch.isfinite(lidar_dis),
+                lidar_dis,
+                torch.full_like(lidar_dis, self.lidar_range),
+            )
+            scan4flow = (self.lidar_range - lidar_dis_for_flow.unsqueeze(1)).reshape(
+                                1, 1,
+                                self.lidar_h_res * self.lidar_h_sample,
+                                self.lidar_v_res * self.lidar_v_sample
+                                )/self.lidar_range
+
+            scan4flow_scaled = torch.nn.functional.interpolate(scan4flow.half() * 255.,
+                                                                self.dismap_flow_size,
+                                                                mode='bilinear',
+                                                                align_corners=False)
+
+            if self.dismap_image_queue is None:
+                self.dismap_image_queue = deque([scan4flow_scaled] * int(self.flow_gap + 3), maxlen=int(self.flow_gap + 3))
+            else:
+                self.dismap_image_queue.append(scan4flow_scaled)
+
+            dismap_tensor = list(self.dismap_image_queue)
+            dismap_image0 = torch.cat(dismap_tensor[:3], dim=1)
+            dismap_image1 = torch.cat(dismap_tensor[-3:], dim=1)
+
+            with torch.no_grad():
+                dismap_image0 = dismap_image0.half()
+                dismap_image1 = dismap_image1.half()
+                dismap_flow = self.flow_est_model(dismap_image0, dismap_image1)[-1]
+
+            if self.dismap_flow_queue is None:
+                self.flow_slide_window = int(self.flow_slide_window)
+                self.dismap_flow_queue = deque([dismap_flow] * self.flow_slide_window, maxlen=self.flow_slide_window)
+            else:
+                self.dismap_flow_queue.append(dismap_flow)
+            dismap_flow_mean = torch.mean(torch.stack(list(self.dismap_flow_queue)), dim=0)
+            dismap_flow_scaled = torch.nn.functional.interpolate(dismap_flow_mean.float(),
+                                                                        self.lidar_resolution,
+                                                                        mode='bilinear',
+                                                                        align_corners=False)
+
+            flow_zoom = torch.nan_to_num(dismap_flow_scaled.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            flow_normalized = torch.cat(
+                [
+                    (flow_zoom[:, 0:1, :, :] / 3.6),
+                    (flow_zoom[:, 1:2, :, :] / 0.6),
+                ],
+                dim=1,
+            )
+            flow_normalized = torch.clamp(flow_normalized, -1.0, 1.0)
+
+        if input_mode in ("mgdp", "mgdp_lite"):
+            denoised_scan = self.lidar_range - depth_denoised
+            denoised_scan = torch.clamp(
+                torch.nan_to_num(denoised_scan / max(self.lidar_range, 1e-6), nan=0.0, posinf=1.0, neginf=0.0),
+                0.0,
+                1.0,
+            )
+
+            dir_z = self.lidar_dirs[..., 2].reshape(1, 1, *self.lidar_resolution)
+            pos_z = drone_state[..., 2].reshape(1, 1, 1, 1)
+            target_z = self.target_pos[..., 2].reshape(1, 1, 1, 1)
+            hit_z = pos_z + dir_z * depth_denoised
+            corridor_half_height = float(self.cfg.task.get("mgdp_corridor_half_height", 1.0))
+            height_risk = 1.0 - torch.clamp((hit_z - target_z).abs() / max(corridor_half_height, 1e-6), 0.0, 1.0)
+            corridor_risk = torch.clamp(height_risk * denoised_scan, 0.0, 1.0)
+
+            approach_risk = torch.clamp(radial_channel, 0.0, 1.0)
+            ttc_risk = torch.clamp(approach_risk * denoised_scan, 0.0, 1.0)
+            dismap_stack = torch.cat([scan_normalized, denoised_scan, corridor_risk, ttc_risk], dim=1)
+        elif input_mode == "mgdp_lite_v2":
+            proximity = torch.clamp(
+                torch.nan_to_num((self.lidar_range - depth_denoised) / max(self.lidar_range, 1e-6), nan=0.0, posinf=1.0, neginf=0.0),
+                0.0,
+                1.0,
+            )
+            speed_scale = float(self.cfg.task.get("mgdp_v2_radial_speed_scale", 6.0))
+            radial_signed = torch.clamp(radial_speed_channel / max(speed_scale, 1e-6), -1.0, 1.0)
+            radial_signed = torch.where(radial_valid_channel, radial_signed, torch.zeros_like(radial_signed))
+
+            target_vec = (self.target_pos - drone_state[..., :3]).squeeze(1)
+            target_vec = target_vec / target_vec.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            ori = self.odom.pose.pose.orientation
+            curr_rot = torch.tensor([[ori.w, ori.x, ori.y, ori.z]], dtype=torch.float32, device=self.device)
+            yaw = quaternion_to_euler(curr_rot)[..., 2]
+            zeros = torch.zeros_like(yaw)
+            q_yaw = euler_to_quaternion(torch.stack([zeros, zeros, yaw], dim=-1))
+            target_sensor = quat_rotate_inverse(q_yaw, target_vec)
+            target_sensor = target_sensor / target_sensor.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+            dir_flat = self.lidar_dirs.reshape(1, -1, 3)
+            depth_flat = depth_denoised.reshape(1, -1)
+            p_hit = dir_flat * depth_flat.unsqueeze(-1)
+            s = (p_hit * target_sensor.unsqueeze(1)).sum(dim=-1)
+            p_perp = p_hit - s.unsqueeze(-1) * target_sensor.unsqueeze(1)
+            d_perp = p_perp.norm(dim=-1).reshape(1, 1, *self.lidar_resolution)
+            sigma = float(self.cfg.task.get("mgdp_v2_corridor_sigma", 1.0))
+            if bool(self.cfg.task.get("mgdp_v2_corridor_speed_adaptive", False)):
+                speed = drone_state[..., 3:].norm(dim=-1).view(1, 1, 1, 1)
+                sigma = sigma + float(self.cfg.task.get("mgdp_v2_corridor_speed_gain", 0.12)) * speed
+            sigma_t = torch.as_tensor(sigma, device=self.device, dtype=d_perp.dtype).clamp_min(1.0e-6)
+            corridor_weight = torch.exp(-0.5 * (d_perp / sigma_t) ** 2)
+            if bool(self.cfg.task.get("mgdp_v2_corridor_forward_only", True)):
+                front_gate = (s.reshape(1, 1, *self.lidar_resolution) > 0.0).float()
+            else:
+                front_gate = torch.ones_like(corridor_weight)
+            corridor_risk = torch.clamp(proximity * corridor_weight * front_gate, 0.0, 1.0)
+
+            closing_speed = torch.clamp(radial_speed_channel, min=0.0)
+            min_closing = float(self.cfg.task.get("mgdp_v2_ttc_min_closing_speed", 0.15))
+            horizon = float(self.cfg.task.get("mgdp_v2_ttc_horizon", 4.0))
+            tau = float(self.cfg.task.get("mgdp_v2_ttc_tau", 1.5))
+            ttc = lidar_scan_dis / closing_speed.clamp_min(1.0e-6)
+            valid_ttc = (lidar_scan_dis > self.lidar_radial_min_depth) & radial_valid_channel & (closing_speed > min_closing) & (ttc < horizon)
+            ttc_risk = torch.exp(-ttc / max(tau, 1.0e-6))
+            ttc_risk = torch.where(valid_ttc, ttc_risk, torch.zeros_like(ttc_risk))
+            ttc_risk = torch.clamp(ttc_risk, 0.0, 1.0)
+
+            dismap_stack = torch.cat([proximity, radial_signed, corridor_risk, ttc_risk], dim=1)
+        else:
+            dismap_stack = torch.cat([scan_normalized, flow_normalized, p2m_radial_channel], dim=1)
 
         obs = {
             "state": torch.cat([target_dir, vel_input, acc_input], dim=-1).squeeze(1),

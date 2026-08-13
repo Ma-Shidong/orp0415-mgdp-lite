@@ -1,0 +1,12 @@
+experiment:
+  phase1_done_fix: d3
+
+task:
+  goal_use_planar: false
+  height_gate_min: 0.30
+  height_w_floor: 4.0
+  bound_line_max_dist: 15.0
+  bound_soft_margin_ratio: 0.65
+  bound_soft_penalty_w: 6.0
+  reward_weights:
+    w_h: 0.65

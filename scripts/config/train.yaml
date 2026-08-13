@@ -10,7 +10,7 @@ headless: false  # default to headless to avoid GLX errors on servers without a 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 3_538_944_000
+total_frames: 3_932_160_000
 max_iters: 12000
 eval_interval: 100
 save_interval: 500
@@ -36,10 +36,11 @@ algo:
   entropy_anneal_frac2: 1.00
   entropy_schedule_mode: by_switch_age  # by_switch_age | by_level
   entropy_decay_iters_per_level: 3200
-  # On curriculum switch, temporarily boost entropy and partially lift actor std.
-  switch_entropy_boost_mult: 1.25
-  switch_entropy_boost_iters: 450
-  switch_std_recover_ratio: 0.35
+  # Keep some exploration on curriculum switch, but avoid the large L4 collapse
+  # we observed immediately after the level-up transition.
+  switch_entropy_boost_mult: 1.10
+  switch_entropy_boost_iters: 250
+  switch_std_recover_ratio: 0.20
   critic_priv_enable: true
   critic_aux_enable: true
   critic_aux_w: 0.05
@@ -52,6 +53,21 @@ algo:
   clip_param: 0.18
   ppo_epochs: 4
   num_minibatches: 4
+  bptt_len: 64
+  sequence_num_minibatches: 4
+
+model:
+  temporal:
+    enable: false
+    type: gru
+    hidden_size: 128
+  teacher_student:
+    enable: false
+    distill_feature_w: 0.05
+    distill_feature_w_end: 0.15
+    distill_priv_w: 0.05
+    distill_priv_w_end: 0.10
+    ramp_iters: 1000
 
 # resume_checkpoint: /home/csj/orp/models/orp6.1.pt
 resume_checkpoint: null  # set to a .pt path to continue training, keep null to start from scratch
@@ -68,6 +84,9 @@ wandb:
   entity:
   project: orp-scripts
   mode: online # set to 'disabled' when debugging locally
+  init_timeout: 300
+  fallback_mode: offline
+  disable_system_metrics: true
   run_id:
   monitor_gym: True
   tags:
@@ -75,4 +94,6 @@ wandb:
 defaults:
   - task: train_env_goal
   - algo: ppo
+  - optional phase1_throughput: p1
+  - optional phase1_done_fix: d4
   - _self_

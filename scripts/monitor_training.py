@@ -44,6 +44,13 @@ def latest_window(blocks, key, window=50):
     return vals[-window:]
 
 
+def latest_with_key(blocks, key):
+    for block in reversed(blocks):
+        if key in block:
+            return block
+    return {}
+
+
 def finite_or_none(v):
     if v is None:
         return None
@@ -54,6 +61,7 @@ def finite_or_none(v):
 
 def classify(blocks):
     latest = blocks[-1]
+    latest_eval = latest_with_key(blocks, "eval/stats.done_success")
     issues = []
     status = "OK"
 
@@ -91,6 +99,47 @@ def classify(blocks):
         issues.append("done_timeout_high")
         status = "WARN" if status != "ALERT" else status
 
+    if latest.get("train/stats.done_acc_limit", 0.0) > 0.35:
+        issues.append("done_acc_limit_high")
+        status = "WARN" if status != "ALERT" else status
+
+    if latest.get("train/stats.target_acc_clip_ratio", 0.0) > 0.20:
+        issues.append("target_acc_clip_high")
+        status = "WARN" if status != "ALERT" else status
+
+    if latest.get("train/stats.control_cmd_clip_ratio", 0.0) > 0.10:
+        issues.append("control_cmd_clip_high")
+        status = "WARN" if status != "ALERT" else status
+
+    eval_done_success_latest = latest_eval.get("eval/stats.done_success")
+    eval_done_height_low_latest = latest_eval.get("eval/stats.done_height_low")
+    train_done_success_latest = latest.get("train/stats.done_success")
+    eval_gap_success = None
+    if (
+        isinstance(train_done_success_latest, (int, float))
+        and math.isfinite(train_done_success_latest)
+        and isinstance(eval_done_success_latest, (int, float))
+        and math.isfinite(eval_done_success_latest)
+    ):
+        eval_gap_success = float(train_done_success_latest - eval_done_success_latest)
+
+    eval_success_hist = latest_window(blocks, "eval/stats.done_success", window=3)
+    if len(eval_success_hist) >= 3 and all(abs(float(v)) <= 1.0e-9 for v in eval_success_hist[-3:]):
+        issues.append("eval_done_success_zero_x3")
+        status = "ALERT"
+
+    if (
+        isinstance(eval_done_height_low_latest, (int, float))
+        and math.isfinite(eval_done_height_low_latest)
+        and eval_done_height_low_latest > 0.40
+    ):
+        issues.append("eval_done_height_low_high")
+        status = "ALERT"
+
+    if eval_gap_success is not None and eval_gap_success > 0.25:
+        issues.append("eval_gap_success_high")
+        status = "WARN" if status != "ALERT" else status
+
     if latest.get("explained_var", 0.0) < -0.10:
         issues.append("explained_var_negative")
         status = "WARN" if status != "ALERT" else status
@@ -114,7 +163,18 @@ def classify(blocks):
         "done_safety": finite_or_none(latest.get("train/stats.done_safety")),
         "done_timeout": finite_or_none(latest.get("train/stats.done_timeout")),
         "done_bound": finite_or_none(latest.get("train/stats.done_bound")),
+        "done_acc_limit": finite_or_none(latest.get("train/stats.done_acc_limit")),
+        "train_done_height_low": finite_or_none(latest.get("train/stats.done_height_low")),
+        "eval_done_success": finite_or_none(eval_done_success_latest),
+        "eval_done_height_low": finite_or_none(eval_done_height_low_latest),
+        "eval_done_safety": finite_or_none(latest_eval.get("eval/stats.done_safety")),
+        "eval_gap_success": finite_or_none(eval_gap_success),
         "avg_speed": finite_or_none(latest.get("train/stats.avg_speed")),
+        "action_abs_max": finite_or_none(latest.get("train/stats.action_abs_max")),
+        "target_acc_abs_max": finite_or_none(latest.get("train/stats.target_acc_abs_max")),
+        "target_acc_clip_ratio": finite_or_none(latest.get("train/stats.target_acc_clip_ratio")),
+        "control_cmd_abs_max": finite_or_none(latest.get("train/stats.control_cmd_abs_max")),
+        "control_cmd_clip_ratio": finite_or_none(latest.get("train/stats.control_cmd_clip_ratio")),
         "entropy": finite_or_none(latest.get("entropy")),
         "explained_var": finite_or_none(latest.get("explained_var")),
         "actor_grad_norm": finite_or_none(latest.get("actor_grad_norm")),
