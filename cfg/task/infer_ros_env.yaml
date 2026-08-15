@@ -44,7 +44,7 @@ lidar_v_edge_margin_deg: 6.0 #/degree
 acc_ref: 9.0
 virtual_ground: 0.5
 virtual_ceiling: 3.5
-# vel_limit: 6.0
+# vel_limit: 5.0
 
 
 # -----------------------------
@@ -71,7 +71,7 @@ fixed_yaw: 0.78539816339
 # virtual constraints (keep behaviour closer to training)
 sim_dt: 0.02
 vel_damping: 0.05
-vel_limit: 6.0
+vel_limit: 5.0
 enable_xy_bound: true
 bound_margin: 0.3
 bound_restitution: 0.0

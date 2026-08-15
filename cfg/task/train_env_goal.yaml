@@ -175,7 +175,7 @@ lidar_update_period: 1
 bound_h: 1.0
 
 # Override env constraints
-vel_max: 7.0
+vel_max: 5.0
 acc_max: 10.0
 # Normalized policy actions are mapped to target_acc via acc_ref.
 # Keep this below the hard health threshold first to stabilize L4 before any GRU work.
