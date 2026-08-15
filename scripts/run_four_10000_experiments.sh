@@ -11,8 +11,13 @@ TMP_ROOT="/media/share/csj/msd/orp_tmp/four_exp_${STAMP}"
 
 mkdir -p "$RUN_ROOT" "$TMP_ROOT"
 
+# Isaac Sim's conda activation script reads shell-specific variables such as
+# ZSH_VERSION. Keep strict mode for the launcher, but relax nounset while
+# activation hooks run.
+set +u
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
+set -u
 
 cd "$REPO_ROOT/scripts"
 
