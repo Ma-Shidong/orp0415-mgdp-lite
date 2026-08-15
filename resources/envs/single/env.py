@@ -578,6 +578,8 @@ class Env(IsaacEnv):
         drone_state_dim = self.drone.state_spec.shape[-1]
         observation_dim = 9
         self.lidar_resolution = (self.lidar_h_res, self.lidar_v_res)
+        input_mode = str(self.cfg.task.get("input_mode", "p2m")).lower()
+        lidar_channels = 3 if input_mode == "p2m_original" else 4
         critic_priv_dim = int(self.cfg.task.get("critic_privileged_dim", getattr(self, "critic_privileged_dim", 15)))
         self.critic_privileged_dim = critic_priv_dim
 
@@ -585,7 +587,7 @@ class Env(IsaacEnv):
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device),
-                    "lidar": UnboundedContinuousTensorSpec((4, self.lidar_resolution[0], self.lidar_resolution[1]), device=self.device),
+                    "lidar": UnboundedContinuousTensorSpec((lidar_channels, self.lidar_resolution[0], self.lidar_resolution[1]), device=self.device),
                 }),
                 "observation_central": UnboundedContinuousTensorSpec((critic_priv_dim,), device=self.device),
                 "intrinsics": self.drone.intrinsics_spec.to(self.device)
@@ -1710,9 +1712,10 @@ class Env(IsaacEnv):
             self._radial_prev_valid[temporal_reset_ids] = True
 
         input_mode = str(self.cfg.task.get("input_mode", "p2m")).lower()
-        if input_mode in ("mgdp", "mgdp_lite", "mgdp_lite_v2"):
+        if input_mode in ("mgdp", "mgdp_lite", "mgdp_lite_v2", "mgdp_lite_v2_no_ch3"):
             flow_zoom = torch.zeros((self.num_envs, 2, *self.lidar_resolution), device=self.device, dtype=self.lidar_scan_dis.dtype)
             flow_scaled = flow_zoom
+            flow_scaled_unclamped = flow_zoom
             self.dismap_flow_zoom = flow_zoom
         else:
             # --- NeuFlow init (ONLY ONCE) ---
@@ -1799,6 +1802,7 @@ class Env(IsaacEnv):
                 ],
                 dim=1,
             )
+            flow_scaled_unclamped = flow_scaled
             flow_scaled = torch.clamp(flow_scaled, -1.0, 1.0)
         # ---- depth (sector/scan) channel: [0, 1]
         scan_normalized = self.lidar_scan / max(self.lidar_range, 1e-6)
@@ -1858,7 +1862,7 @@ class Env(IsaacEnv):
             # MGDP-lite: four interpretable [0, 1] risk maps.
             # [current proximity, denoised proximity, flight-corridor risk, dynamic/TTC risk]
             self.dismap_stack = torch.cat([scan_normalized, denoised_scan, corridor_risk, ttc_risk], dim=1)
-        elif input_mode == "mgdp_lite_v2":
+        elif input_mode in ("mgdp_lite_v2", "mgdp_lite_v2_no_ch3"):
             self.dismap_stack = self._build_mgdp_lite_v2_observation(
                 scan_normalized=scan_normalized,
                 depth_denoised=depth_denoised,
@@ -1870,12 +1874,18 @@ class Env(IsaacEnv):
                 curr_rot=curr_rot,
                 vel_w=vel_fb.squeeze(1),
             )
+            if input_mode == "mgdp_lite_v2_no_ch3":
+                self.dismap_stack = self.dismap_stack.clone()
+                self.dismap_stack[:, 3:4] = 0.0
+        elif input_mode == "p2m_original":
+            self.dismap_stack = torch.cat([scan_normalized, flow_scaled_unclamped], dim=1)
         else:
             # P2M/legacy: [depth(1), NeuFlow(2), radial(1)].
             self.dismap_stack = torch.cat([scan_normalized, flow_scaled, p2m_radial_channel], dim=1)
         # debug shapes (enable only when needed)
         assert scan_normalized.shape[1] == 1
-        assert self.dismap_stack.shape[1] == 4, f"dismap_stack channels={self.dismap_stack.shape}"
+        expected_channels = 3 if input_mode == "p2m_original" else 4
+        assert self.dismap_stack.shape[1] == expected_channels, f"dismap_stack channels={self.dismap_stack.shape}"
         # assert torch.isfinite(self.dismap_stack).all(), "dismap_stack contains NaN/Inf"
         if self.cfg.task.get("debug_checks", False):
             assert torch.isfinite(self.dismap_stack).all()  
@@ -2124,24 +2134,35 @@ class Env(IsaacEnv):
         reward_safety = torch.zeros((self.num_envs, 1), device=self.device)
         reward_dobs = torch.zeros((self.num_envs, 1), device=self.device)
 
-        if reward_mode == "p2m":
-            k_v = float(rw.get("k_v", rw.get("w_v", 1.2)))
-            k_a = float(rw.get("k_a", rw.get("w_a", 0.6)))
-            k_j = float(rw.get("k_j", rw.get("w_j", 0.2)))
-            k_h = float(rw.get("k_h", rw.get("w_h", 0.3)))
-            k_g = float(rw.get("k_g", rw.get("w_g", 0.8)))
-            k_s = float(rw.get("k_s", 1.0))
-            k_d = float(rw.get("k_d", 0.6))
+        if reward_mode in ("p2m", "p2m_original"):
+            original_p2m = reward_mode == "p2m_original"
+            if original_p2m:
+                k_v, k_a, k_j, k_h, k_g, k_s, k_d = 1.2, 0.6, 0.2, 0.3, 0.8, 1.0, 0.6
+                beta_vel, beta_acc, beta_hei = 2.0, 5.0, 2.0
+                acc_set_min = 0.0
+                acc_set_max = self.acc_max
+                hei_set_min = self.fly_height - self.height_bound / 2
+                hei_set_max = self.fly_height + self.height_bound / 2
+            else:
+                k_v = float(rw.get("k_v", rw.get("w_v", 1.2)))
+                k_a = float(rw.get("k_a", rw.get("w_a", 0.6)))
+                k_j = float(rw.get("k_j", rw.get("w_j", 0.2)))
+                k_h = float(rw.get("k_h", rw.get("w_h", 0.3)))
+                k_g = float(rw.get("k_g", rw.get("w_g", 0.8)))
+                k_s = float(rw.get("k_s", 1.0))
+                k_d = float(rw.get("k_d", 0.6))
 
-            beta_vel = float(self.cfg.task.get("p2m_beta_vel", 2.0))
-            beta_acc = float(self.cfg.task.get("p2m_beta_acc", 5.0))
-            beta_hei = float(self.cfg.task.get("p2m_beta_hei", 2.0))
-            hei_set_min = float(self.cfg.task.get("p2m_hei_set_min", self.fly_height - self.height_bound / 2))
-            hei_set_max = float(self.cfg.task.get("p2m_hei_set_max", self.fly_height + self.height_bound / 2))
+                beta_vel = float(self.cfg.task.get("p2m_beta_vel", 2.0))
+                beta_acc = float(self.cfg.task.get("p2m_beta_acc", 5.0))
+                beta_hei = float(self.cfg.task.get("p2m_beta_hei", 2.0))
+                acc_set_min = self.acc_min
+                acc_set_max = self.acc_max
+                hei_set_min = float(self.cfg.task.get("p2m_hei_set_min", self.fly_height - self.height_bound / 2))
+                hei_set_max = float(self.cfg.task.get("p2m_hei_set_max", self.fly_height + self.height_bound / 2))
 
             reward_vel, reward_acc, reward_jerk, reward_height = self._compute_p2m_state_reward(
                 beta_vel, self.vel_min, self.vel_max, vel_magnitude,
-                beta_acc, self.acc_min, self.acc_max, acc_magnitude,
+                beta_acc, acc_set_min, acc_set_max, acc_magnitude,
                 beta_hei, hei_set_min, hei_set_max, height,
                 acc, self.last_acc, touch_goal_mask,
             )
@@ -2314,12 +2335,14 @@ class Env(IsaacEnv):
             ).view(-1, 1)
 
         # success bonus (optional)
-        success_bonus = float(self.cfg.task.get("success_bonus", 0.0))
+        original_p2m_reward = reward_mode == "p2m_original"
+
+        success_bonus = 0.0 if original_p2m_reward else float(self.cfg.task.get("success_bonus", 0.0))
         if success_bonus != 0.0:
             reward = reward + success_bonus * success_mask.float().view(-1, 1)
 
         # time penalty (optional)
-        time_penalty = float(self.cfg.task.get("time_penalty", 0.0))
+        time_penalty = 0.0 if original_p2m_reward else float(self.cfg.task.get("time_penalty", 0.0))
         if time_penalty != 0.0:
             mode = str(self.cfg.task.get("time_penalty_mode", "constant")).lower()
             if mode in ("stagnation", "stall", "stagnant"):
@@ -2356,7 +2379,7 @@ class Env(IsaacEnv):
         # policy avoids late boundary terminations in L3/L4.
         bound_line_max_dist = float(self.cfg.task.get("bound_line_max_dist", 8.0))
         reward_bound = torch.zeros_like(reward_goal)
-        if bool(self.cfg.task.get("bound_soft_penalty_enable", False)):
+        if (not original_p2m_reward) and bool(self.cfg.task.get("bound_soft_penalty_enable", False)):
             drone_xy = self.drone_state[..., :2].squeeze(1)
             start_xy = self.start_pos[..., :2].squeeze(1)
             target_xy = self.target_pos[..., :2].squeeze(1)
@@ -2528,7 +2551,7 @@ class Env(IsaacEnv):
         # collision penalty (does not replace risk shaping)
         # -------------------------
         reward_collision = torch.zeros_like(reward)
-        collision_penalty = float(self.cfg.task.get("collision_penalty", 0.0))
+        collision_penalty = 0.0 if original_p2m_reward else float(self.cfg.task.get("collision_penalty", 0.0))
         if collision_penalty != 0.0:
             collision_include_height = bool(self.cfg.task.get("collision_include_height", True))
             collision_mask = safety_mask

@@ -57,6 +57,7 @@ algo:
   sequence_num_minibatches: 4
 
 model:
+  policy_variant: orp  # orp | p2m_original
   temporal:
     enable: false
     type: gru

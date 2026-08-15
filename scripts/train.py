@@ -78,16 +78,18 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.model_cfg = model_cfg
         self.device = device
+        self.policy_variant = str(getattr(model_cfg, "policy_variant", "orp") if model_cfg is not None else "orp").lower()
+        self.is_p2m_original = self.policy_variant == "p2m_original"
 
-        self.entropy_coef = float(getattr(cfg, "entropy_coef", 0.01))
-        self.clip_param = float(getattr(cfg, "clip_param", 0.2))
+        self.entropy_coef = 0.001 if self.is_p2m_original else float(getattr(cfg, "entropy_coef", 0.01))
+        self.clip_param = 0.1 if self.is_p2m_original else float(getattr(cfg, "clip_param", 0.2))
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
-        self.gae = GAE(0.995, 0.95)
+        self.gae = GAE(0.99, 0.95) if self.is_p2m_original else GAE(0.995, 0.95)
         self._critic_priv_key = ("agents", "observation_central")
         obs_keys = set(observation_spec.keys(True, True))
-        self.use_critic_priv = bool(getattr(cfg, "critic_priv_enable", True)) and (self._critic_priv_key in obs_keys)
-        self.use_critic_aux = bool(getattr(cfg, "critic_aux_enable", False))
+        self.use_critic_priv = (not self.is_p2m_original) and bool(getattr(cfg, "critic_priv_enable", True)) and (self._critic_priv_key in obs_keys)
+        self.use_critic_aux = (not self.is_p2m_original) and bool(getattr(cfg, "critic_aux_enable", False))
         self.critic_aux_w = float(getattr(cfg, "critic_aux_w", 0.0))
         aux_idx_cfg = getattr(cfg, "critic_aux_target_idx", (0, 4, 5, 7))
         self.critic_aux_target_idx = tuple(int(i) for i in aux_idx_cfg)
@@ -95,7 +97,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.sequence_num_minibatches = max(1, int(getattr(cfg, "sequence_num_minibatches", getattr(cfg, "num_minibatches", 4))))
 
         temporal_cfg = getattr(model_cfg, "temporal", None) if model_cfg is not None else None
-        self.temporal_enable = bool(getattr(temporal_cfg, "enable", False))
+        self.temporal_enable = (not self.is_p2m_original) and bool(getattr(temporal_cfg, "enable", False))
         self.temporal_type = str(getattr(temporal_cfg, "type", "gru")).lower()
         self.temporal_hidden_size = int(getattr(temporal_cfg, "hidden_size", 128))
         if self.temporal_enable and self.temporal_type != "gru":
@@ -104,7 +106,7 @@ class PPOPolicy(TensorDictModuleBase):
             raise ValueError("Current GRU temporal core requires hidden_size=128 to preserve residual dimensions.")
 
         teacher_cfg = getattr(model_cfg, "teacher_student", None) if model_cfg is not None else None
-        self.teacher_enable = bool(getattr(teacher_cfg, "enable", False)) and self.use_critic_priv
+        self.teacher_enable = (not self.is_p2m_original) and bool(getattr(teacher_cfg, "enable", False)) and self.use_critic_priv
         self.distill_feature_w_start = float(getattr(teacher_cfg, "distill_feature_w", 0.05)) if teacher_cfg is not None else 0.05
         self.distill_feature_w_end = float(getattr(teacher_cfg, "distill_feature_w_end", 0.15)) if teacher_cfg is not None else 0.15
         self.distill_priv_w_start = float(getattr(teacher_cfg, "distill_priv_w", 0.05)) if teacher_cfg is not None else 0.05
@@ -138,17 +140,14 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.temporal_core = GRU(128, self.temporal_hidden_size).to(self.device) if self.temporal_enable else None
 
+        actor_head = Actor(
+            self.action_dim,
+            log_std_min=-100.0 if self.is_p2m_original else float(getattr(cfg, "actor_log_std_min", -2.5)),
+            log_std_max=100.0 if self.is_p2m_original else float(getattr(cfg, "actor_log_std_max", 0.0)),
+            log_std_init=0.0 if self.is_p2m_original else float(getattr(cfg, "actor_log_std_init", 0.0)),
+        )
         self.actor = ProbabilisticActor(
-            TensorDictModule(
-                Actor(
-                    self.action_dim,
-                    log_std_min=float(getattr(cfg, "actor_log_std_min", -2.5)),
-                    log_std_max=float(getattr(cfg, "actor_log_std_max", 0.0)),
-                    log_std_init=float(getattr(cfg, "actor_log_std_init", 0.0)),
-                ),
-                ["_feature"],
-                ["loc", "scale"],
-            ),
+            TensorDictModule(actor_head, ["_feature"], ["loc", "scale"]),
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
@@ -230,8 +229,8 @@ class PPOPolicy(TensorDictModuleBase):
         if self.teacher_priv_head is not None:
             self.teacher_priv_head.apply(init_)
 
-        actor_lr = float(getattr(cfg, "actor_lr", 1.5e-4))
-        critic_lr = float(getattr(cfg, "critic_lr", 3.0e-4))
+        actor_lr = 5.0e-4 if self.is_p2m_original else float(getattr(cfg, "actor_lr", 1.5e-4))
+        critic_lr = 5.0e-4 if self.is_p2m_original else float(getattr(cfg, "critic_lr", 3.0e-4))
         encoder_lr = actor_lr
         encoder_params = list(self.encoder.parameters())
         if self.temporal_core is not None:
@@ -868,6 +867,9 @@ def main(cfg):
         """On curriculum switch, partially restore exploration by lifting actor log-std."""
         out: Dict[str, float] = {}
         try:
+            if getattr(policy, "is_p2m_original", False):
+                out["train/switch_std_reset_applied"] = 0.0
+                return out
             actor_core = _find_actor_core_module(getattr(policy, "actor", None))
             if actor_core is None or not hasattr(actor_core, "actor_std"):
                 out["train/switch_std_reset_applied"] = 0.0
@@ -1042,62 +1044,66 @@ def main(cfg):
                 # do not fail training if batch stats are missing
                 pass
 
-        # Entropy schedule (decoupled from level by default):
-        # - by_switch_age: decay within each level using iterations since last switch.
-        # - by_level: legacy behavior coupled to unlocked curriculum level.
-        try:
-            ent_start = float(getattr(cfg.algo, "entropy_coef", 0.01))
-            ent_mid = float(getattr(cfg.algo, "entropy_coef_mid"))
-            ent_end = float(getattr(cfg.algo, "entropy_coef_end"))
-            f1 = float(getattr(cfg.algo, "entropy_anneal_frac1", 0.3))
-            f2 = float(getattr(cfg.algo, "entropy_anneal_frac2", 0.7))
-            mode = str(getattr(cfg.algo, "entropy_schedule_mode", "by_switch_age")).lower()
-            if mode in ("by_level", "level"):
-                max_level = 0
-                if hasattr(cfg.task, "success_curriculum") and hasattr(cfg.task.success_curriculum, "levels"):
-                    try:
-                        max_level = max(0, len(cfg.task.success_curriculum.levels) - 1)
-                    except Exception:
-                        max_level = 0
-                unlocked_level = 0
-                try:
-                    unlocked_level = int(getattr(curr_mgr, "level", 0))
-                except Exception:
+        if getattr(policy, "is_p2m_original", False):
+            info["train/entropy_coef"] = float(policy.entropy_coef)
+            info["train/entropy_switch_boost"] = 1.0
+        else:
+            # Entropy schedule (decoupled from level by default):
+            # - by_switch_age: decay within each level using iterations since last switch.
+            # - by_level: legacy behavior coupled to unlocked curriculum level.
+            try:
+                ent_start = float(getattr(cfg.algo, "entropy_coef", 0.01))
+                ent_mid = float(getattr(cfg.algo, "entropy_coef_mid"))
+                ent_end = float(getattr(cfg.algo, "entropy_coef_end"))
+                f1 = float(getattr(cfg.algo, "entropy_anneal_frac1", 0.3))
+                f2 = float(getattr(cfg.algo, "entropy_anneal_frac2", 0.7))
+                mode = str(getattr(cfg.algo, "entropy_schedule_mode", "by_switch_age")).lower()
+                if mode in ("by_level", "level"):
+                    max_level = 0
+                    if hasattr(cfg.task, "success_curriculum") and hasattr(cfg.task.success_curriculum, "levels"):
+                        try:
+                            max_level = max(0, len(cfg.task.success_curriculum.levels) - 1)
+                        except Exception:
+                            max_level = 0
                     unlocked_level = 0
-                if max_level <= 0:
-                    progress = 0.0
+                    try:
+                        unlocked_level = int(getattr(curr_mgr, "level", 0))
+                    except Exception:
+                        unlocked_level = 0
+                    if max_level <= 0:
+                        progress = 0.0
+                    else:
+                        progress = float(max(0, min(unlocked_level, max_level))) / float(max_level)
                 else:
-                    progress = float(max(0, min(unlocked_level, max_level))) / float(max_level)
-            else:
-                decay_iters = int(getattr(cfg.algo, "entropy_decay_iters_per_level", 600))
-                decay_iters = max(1, decay_iters)
-                last_switch_iter = int(getattr(curr_mgr, "_last_switch_iter", -1))
-                if last_switch_iter < 0:
-                    age = int(i)
+                    decay_iters = int(getattr(cfg.algo, "entropy_decay_iters_per_level", 600))
+                    decay_iters = max(1, decay_iters)
+                    last_switch_iter = int(getattr(curr_mgr, "_last_switch_iter", -1))
+                    if last_switch_iter < 0:
+                        age = int(i)
+                    else:
+                        age = max(0, int(i) - last_switch_iter)
+                    progress = min(1.0, float(age) / float(decay_iters))
+                    info["train/entropy_age_iters"] = float(age)
+                    info["train/entropy_schedule_progress"] = float(progress)
+                if progress <= f1:
+                    ent_coef = ent_start
+                elif progress <= f2:
+                    ent_coef = ent_start + (ent_mid - ent_start) * ((progress - f1) / max(1e-6, (f2 - f1)))
                 else:
-                    age = max(0, int(i) - last_switch_iter)
-                progress = min(1.0, float(age) / float(decay_iters))
-                info["train/entropy_age_iters"] = float(age)
-                info["train/entropy_schedule_progress"] = float(progress)
-            if progress <= f1:
-                ent_coef = ent_start
-            elif progress <= f2:
-                ent_coef = ent_start + (ent_mid - ent_start) * ((progress - f1) / max(1e-6, (f2 - f1)))
-            else:
-                ent_coef = ent_mid + (ent_end - ent_mid) * ((progress - f2) / max(1e-6, (1.0 - f2)))
-            switch_age = int(i) - int(last_switch_iter_for_entropy_boost)
-            if switch_entropy_boost_iters > 0 and switch_age >= 0 and switch_age < switch_entropy_boost_iters:
-                fade = 1.0 - (float(switch_age) / float(max(1, switch_entropy_boost_iters)))
-                boost = 1.0 + (switch_entropy_boost_mult - 1.0) * fade
-                ent_coef *= boost
-                info["train/entropy_switch_boost"] = float(boost)
-                info["train/entropy_switch_age_iters"] = float(switch_age)
-            else:
-                info["train/entropy_switch_boost"] = 1.0
-            policy.entropy_coef = float(ent_coef)
-            info["train/entropy_coef"] = float(ent_coef)
-        except Exception:
-            pass
+                    ent_coef = ent_mid + (ent_end - ent_mid) * ((progress - f2) / max(1e-6, (1.0 - f2)))
+                switch_age = int(i) - int(last_switch_iter_for_entropy_boost)
+                if switch_entropy_boost_iters > 0 and switch_age >= 0 and switch_age < switch_entropy_boost_iters:
+                    fade = 1.0 - (float(switch_age) / float(max(1, switch_entropy_boost_iters)))
+                    boost = 1.0 + (switch_entropy_boost_mult - 1.0) * fade
+                    ent_coef *= boost
+                    info["train/entropy_switch_boost"] = float(boost)
+                    info["train/entropy_switch_age_iters"] = float(switch_age)
+                else:
+                    info["train/entropy_switch_boost"] = 1.0
+                policy.entropy_coef = float(ent_coef)
+                info["train/entropy_coef"] = float(ent_coef)
+            except Exception:
+                pass
 
         if len(episode_stats) >= cfg.task.env.num_envs:
             log_ready = True
